@@ -1,0 +1,112 @@
+#floatingContainer {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  z-index: 999;
+}
+
+#floatingBtn {
+  width: 60px;
+  height: 60px;
+  border-radius: 50%;
+  background-color: #007bff;
+  color: white;
+  border: none;
+  font-size: 32px;
+  cursor: pointer;
+}
+
+#options {
+  display: none;
+  position: absolute;        /* 親（floatingContainer）に相対的に配置 */
+  top: 70px;                 /* ボタンの高さ60px + 余白10px */
+  right: 0;
+  width: 200px;
+  border: 1px solid #ccc;
+  background-color: #f9f9f9;
+  padding: 10px;
+  z-index: 1000;
+}
+
+.popup {
+  position: fixed;
+  top: 90px;      /* 同じくボタンの下に */
+  right: 20px;
+  background: white;
+  border: 1px solid #ccc;
+  padding: 10px;
+  width: 220px;
+  z-index: 999;
+}
+
+
+.option-item {
+  padding: 8px;
+  cursor: pointer;
+}
+
+.option-item:hover {
+  background-color: #e0e0e0;
+}
+
+
+
+
+#toc li#toc-b2 {
+  list-style-type: none;
+  margin-left: 0;
+}
+
+
+
+
+
+/* 通常（ライト）テーマはそのまま */
+
+/* ライトテーマ（デフォルト） */
+a {
+  color: black;
+  text-decoration: underline;
+}
+
+/* ダークテーマ */
+body.dark-theme a {
+  color: white;
+}
+
+body.dark-theme a:hover {
+  color: #80bfff; /* ダークテーマ用ホバー色 */
+}
+
+/* 通常（ライト）テーマはそのまま */
+
+body.dark-theme {
+  background-color: #121212;
+  color: #eee;
+}
+
+body.dark-theme hr {
+  border-top: 2px solid #eee;
+}
+
+body.dark-theme #floatingBtn {
+  background-color: #1a73e8;
+  color: white;
+  box-shadow: 0 4px 8px rgba(255,255,255,0.2);
+}
+
+body.dark-theme #floatingBtn:hover {
+  background-color: #155ab6;
+}
+
+body.dark-theme #options,
+body.dark-theme .popup {
+  background-color: #1f1f1f;
+  border-color: #444;
+  color: #ccc;
+}
+
+body.dark-theme .option-item:hover {
+  background-color: #333;
+}
+

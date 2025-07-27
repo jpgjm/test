@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+	<meta charset="UTF-8">
+	<link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+	<h1>野良アプリ一覧</h1>
+	<hr>
+	<h2 id="section-nonroot">非rootユーザー向け</h2>
+	<div id="nonroot-apps-container">読み込み中...</div>
+	<script src="load-apps.js"></script>
+	<hr>
+	<h2>rootユーザー向け</h2>
+	<ul>
+		<li>
+			<a href="https://github.com/WSTxda/ViperFX-RE-Releases">ViPER4Android FX Redesign (ViperFX RE)</a>
+		</li>
+		<p>イコライザー。</p>
+	</ul>
+	<hr>
+	<h2>Magisk モジュール</h2>
+	<ul>
+		<li id="Audio Modification Library Ryuki Mod Magisk Module">
+			<a href="https://www.pling.com/p/1981006/">Audio Modification Library Ryuki Mod Magisk Module</a>
+			<p>複数のオーディオmodを入れるときに競合しないようにする。</p>
+		</li>
+
+		<li id="Dfps">
+			<a href="https://github.com/yc9559/dfps">Dfps</a>
+			<p>固定式リフレッシュレートを擬似的に可変式リフレッシュレートを再現する。</p>
+		</li>
+
+		<li id="JamesDSP (Cross-platform Audio Effect / Digital Signal Processing library)">
+			<a href="https://github.com/james34602/JamesDSPManager">JamesDSP (Cross-platform Audio Effect / Digital Signal Processing library)</a>
+			<p>イコライザー。</p>
+		</li>
+
+		<li>
+			<a href="https://github.com/JingMatrix/LSPosed">LSPosed Framework</a>
+			<p>システムやアプリの動作を変更できるモジュール。</p>
+		</li>
+
+		<li>
+			<a href="https://github.com/j7b3y/QuickSwitch">QuickSwitch fork</a>
+			<p>サードパーティー製のサポートされているランチャーが「タスク管理ボタン」を使用できるようにする。</p>
+		</li>
+
+		<li>
+			<a href="https://github.com/PerformanC/ReZygisk">ReZygisk</a>
+			<p>Zygisk Nextのオープンソース版。</p>
+		</li>
+
+		<li>
+			<a href="https://github.com/dchristl/KernelSU-systemless-hosts">Systemless hosts for KernelSU</a>
+			<p>zygiskを搭載されていないrootマネージャーはこの類のモジュールを使わないとhostsが変更できない。</p>
+		</li>
+
+		<li>
+			<a href="https://github.com/jpgjm/Systemless-Debloater">Systemless-Debloater</a>
+			<p>システムレスでアプリを削除する。</p>
+		</li>
+
+		<li>
+			<a href="https://github.com/WSTxda/ViPERFX_RE">ViPERFX_RE</a>
+			<p>イコライザー。</p>
+		</li>
+
+		<li>
+			<a href="https://github.com/j-hc/zygisk-detach">zygisk-detach</a>
+			<p>対象のアプリに対してGoogle Playストアからの自動更新を無効化できる。</p>
+		</li>
+
+		<li>
+			<a href="https://github.com/jpgjm/Change-Volume-Step">Change-Volume-Step</a>
+			<p>1ボリューム当たりの音量を変更する。</p>
+		</li>
+
+		<li>
+			<a href="https://github.com/jpgjm/Removed-some-power-menu-and-battery-items">Removed-some-power-menu-and-battery-items</a>
+			<p>電源メニューの一部を非表示、バッテリーアイコンの非表示をする。（キャリア版Xperiaの場合はカメラ音を無効できる。）</p>
+		</li>
+	</ul>
+
+	<div id="floatingContainer">
+		<button id="floatingBtn">≡</button>
+		<div id="options" class="popup" style="display: none;">
+			<div class="option-item" id="showToc">目次</div>
+			<button id="toggleThemeBtn" class="option-item" style="all: unset; cursor: pointer;">テーマ変更</button>
+			<div class="option-item">候補3</div>
+		</div>
+	</div>
+	<div id="toc" class="popup" style="display: none;">
+		<ul>
+			<a href="#section-nonroot">非rootユーザー向け</a>
+			<li><a href="#auxio">Auxio</a></li>
+			<li><a href="#tiles">Better Internet Tiles</a></li>
+			<li><a href="#clock">Clock</a></li>
+			<li><a href="#limes">LIMEs</a></li>
+			<li><a href="#ReVanced eXtended">ReVanced eXtended</a></li>
+			<li><a href="#ytdlnis">YTDLins</a></li>
+		</ul>
+	</div>
+	<script src="script.js"></script>
+</body>
+
+</html>
