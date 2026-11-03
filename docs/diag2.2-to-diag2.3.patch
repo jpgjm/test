@@ -1,0 +1,219 @@
+diff -ruN a/.github/workflows/build-guest-intent.yml b/.github/workflows/build-guest-intent.yml
+--- a/.github/workflows/build-guest-intent.yml	2026-11-03 05:58:55.691766574 +0000
++++ b/.github/workflows/build-guest-intent.yml	2026-11-03 06:25:18.009497196 +0000
+@@ -7,7 +7,7 @@
+ # +SideStore 版は作らない。build_github.sh が SideStore の
+ # Metadata.appintents で上書きするため、LCGuestIntent が消える。
+ 
+-name: Build IPA (LCGuestIntent diag2.2)
++name: Build IPA (LCGuestIntent diag2.3)
+ 
+ on:
+   push:
+@@ -92,7 +92,7 @@
+             exit 1
+           fi
+           # diag2.1: 型紙を複製する版 / diag2.2: 実行時のメタデータ対策が入ったか
+-          for marker in "actionWithParameters:" "isAppMetadataViaXPCEnabled" "initWithBundle:usingEffectiveBundleIdentifier:error:"; do
++          for marker in "actionWithParameters:" "isAppMetadataViaXPCEnabled" "initWithBundle:usingEffectiveBundleIdentifier:error:" "initWithMetadata:mangledTypeName:parameters:"; do
+             if strings "$app/Frameworks/TweakLoader.dylib" | grep -q "$marker"; then
+               echo "OK: AlarmKitBridge ($marker)"
+             else
+@@ -111,5 +111,5 @@
+       - name: Upload IPA
+         uses: actions/upload-artifact@v4
+         with:
+-          name: LiveContainer-guestintent-diag2.2.ipa
++          name: LiveContainer-guestintent-diag2.3.ipa
+           path: LiveContainer.ipa
+diff -ruN a/TweakLoader/AlarmKitBridge.m b/TweakLoader/AlarmKitBridge.m
+--- a/TweakLoader/AlarmKitBridge.m	2026-11-03 05:58:55.704549374 +0000
++++ b/TweakLoader/AlarmKitBridge.m	2026-11-03 06:24:59.332928621 +0000
+@@ -29,6 +29,7 @@
+ //     引数だけ差し替える。metadata と systemProtocols が型紙と同じになる。
+ //  diag2.2: LiveProcess で実行するとき intentNotFound になる問題への対策
+ //     (ゲストのメタデータの付け直しと、AppManager への静的メタデータの強制)。
++//  diag2.3: 付け直しの作り方を 3 通りに (diag2.2 では存在確認で弾かれて試されなかった)。
+ //
+ //  記録先 (ゲストのコンテナ): Documents/LCBridge/bridge.log
+ //  型紙 (LiveContainer の Documents): Documents/LCBridge/template-lcguestintent.archive
+@@ -471,32 +472,101 @@
+     return actionMetadata;
+ }
+ 
++/// LNAction の init 系メソッドを列挙して記録する (diag2.3 の診断)。
++static void LCBDescribeActionInitializers(Class actionClass) {
++    unsigned int count = 0;
++    Method *methods = class_copyMethodList(actionClass, &count);
++    NSMutableArray *names = [NSMutableArray array];
++    for (unsigned int i = 0; i < count; i++) {
++        NSString *name = NSStringFromSelector(method_getName(methods[i]));
++        if ([name containsString:@"nit"] || [name hasPrefix:@"actionWith"] || [name containsString:@"etadata"]) {
++            [names addObject:name];
++        }
++    }
++    free(methods);
++    LCBLog(@"  LNAction (%@) のメソッド %u 個のうち関係するもの: %@",
++           NSStringFromClass(actionClass), count, [names componentsJoinedByString:@" | "]);
++}
++
+ /// 元の LNAction に metadata を付けた複製を作る。
+-/// `-[LNAction actionWithParameters:]` と同じ初期化メソッド (23G83 で確認) を使う。
++///
++/// diag2.2 の実測: `instancesRespondToSelector:` が `_initWithIdentifier:…metadata:` に NO を返し、
++/// 付け直しが一度も試されなかった (23G83 の LinkMetadata にはこのメソッドがある)。
++/// diag2.3 では次の順に試し、どれで作れたかを記録する。
++///   1. `_initWithIdentifier:…:metadata:` を class_getInstanceMethod の IMP で直接呼ぶ
++///   2. 複製 (`copy`) に KVC で `metadata` を入れる (ivar `_metadata`)
++///   3. `initWithMetadata:mangledTypeName:parameters:` (systemProtocols は metadata 由来になる)
+ static id LCBActionWithMetadata(id action, id metadata) {
+-    SEL init = NSSelectorFromString(@"_initWithIdentifier:mangledTypeName:openAppWhenRun:explicitAuthenticationPolicy:outputFlags:outputType:systemProtocols:parameters:metadata:");
+     Class actionClass = NSClassFromString(@"LNAction");
+-    if (![actionClass instancesRespondToSelector:init]) {
+-        LCBLog(@"  LNAction が %@ に応答しません", NSStringFromSelector(init));
+-        return nil;
++    Class runtimeClass = [action class];
++    if (runtimeClass != actionClass) {
++        LCBLog(@"  復元した LNAction の実クラスは %@", NSStringFromClass(runtimeClass));
+     }
++
++    // 1. 9 引数の内部 init を IMP で直接呼ぶ
++    SEL fullInit = NSSelectorFromString(@"_initWithIdentifier:mangledTypeName:openAppWhenRun:explicitAuthenticationPolicy:outputFlags:outputType:systemProtocols:parameters:metadata:");
++    Method fullMethod = class_getInstanceMethod(actionClass, fullInit);
++    LCBLog(@"  付け直し 1: class_getInstanceMethod=%@ instancesRespondToSelector=%@",
++           fullMethod ? @"あり" : @"なし", [actionClass instancesRespondToSelector:fullInit] ? @"YES" : @"NO");
++    if (fullMethod) {
++        @try {
++            typedef id (*InitFunction)(id, SEL, id, id, BOOL, id, id, id, id, id, id);
++            InitFunction function = (InitFunction)method_getImplementation(fullMethod);
++            id result = function([actionClass alloc], fullInit,
++                                 [action valueForKey:@"identifier"],
++                                 [action valueForKey:@"mangledTypeName"],
++                                 [[action valueForKey:@"openAppWhenRun"] boolValue],
++                                 [action valueForKey:@"explicitAuthenticationPolicy"],
++                                 [action valueForKey:@"outputFlags"],
++                                 [action valueForKey:@"outputType"],
++                                 [action valueForKey:@"systemProtocols"],
++                                 [action valueForKey:@"parameters"],
++                                 metadata);
++            if (result && [result valueForKey:@"metadata"]) {
++                LCBLog(@"  付け直し 1 で作れました");
++                return result;
++            }
++            LCBLog(@"  付け直し 1: 結果に metadata がありません");
++        } @catch (NSException *e) {
++            LCBLog(@"  付け直し 1 で例外: %@", e);
++        }
++    } else {
++        LCBDescribeActionInitializers(actionClass);
++    }
++
++    // 2. 複製に KVC で入れる
+     @try {
+-        typedef id (*InitFunction)(id, SEL, id, id, BOOL, id, id, id, id, id, id);
+-        return ((InitFunction)objc_msgSend)(
+-            [actionClass alloc], init,
+-            [action valueForKey:@"identifier"],
+-            [action valueForKey:@"mangledTypeName"],
+-            [[action valueForKey:@"openAppWhenRun"] boolValue],
+-            [action valueForKey:@"explicitAuthenticationPolicy"],
+-            [action valueForKey:@"outputFlags"],
+-            [action valueForKey:@"outputType"],
+-            [action valueForKey:@"systemProtocols"],
+-            [action valueForKey:@"parameters"],
+-            metadata);
++        id copy = [action copy];
++        [copy setValue:metadata forKey:@"metadata"];
++        if ([copy valueForKey:@"metadata"]) {
++            LCBLog(@"  付け直し 2 (KVC) で作れました");
++            return copy;
++        }
++        LCBLog(@"  付け直し 2: KVC 後も metadata がありません");
+     } @catch (NSException *e) {
+-        LCBLog(@"  metadata 付きの LNAction を作れません: %@", e);
+-        return nil;
++        LCBLog(@"  付け直し 2 で例外: %@", e);
++    }
++
++    // 3. metadata から作る init
++    SEL metaInit = NSSelectorFromString(@"initWithMetadata:mangledTypeName:parameters:");
++    Method metaMethod = class_getInstanceMethod(actionClass, metaInit);
++    if (metaMethod) {
++        @try {
++            typedef id (*MetaInitFunction)(id, SEL, id, id, id);
++            id result = ((MetaInitFunction)method_getImplementation(metaMethod))(
++                [actionClass alloc], metaInit, metadata,
++                [action valueForKey:@"mangledTypeName"], [action valueForKey:@"parameters"]);
++            if (result) {
++                LCBLog(@"  付け直し 3 (initWithMetadata:mangledTypeName:parameters:) で作れました");
++                return result;
++            }
++        } @catch (NSException *e) {
++            LCBLog(@"  付け直し 3 で例外: %@", e);
++        }
++    } else {
++        LCBLog(@"  付け直し 3: initWithMetadata:mangledTypeName:parameters: がありません");
+     }
++    return nil;
+ }
+ 
+ /// LNAppContext で 1 回実行する。completion は main キューで呼ぶ。
+diff -ruN a/docs/AlarmKitBridge-diag2.md b/docs/AlarmKitBridge-diag2.md
+--- a/docs/AlarmKitBridge-diag2.md	2026-11-03 05:58:55.705862356 +0000
++++ b/docs/AlarmKitBridge-diag2.md	2026-11-03 06:25:18.010207990 +0000
+@@ -1,8 +1,9 @@
+-# AlarmKitBridge 検証版 (diag2 / diag2.1 / diag2.2)
++# AlarmKitBridge 検証版 (diag2 〜 diag2.3)
+ 
+ > **diag2.1 (2026-11-03)**: 包み替えの作り方だけを変えた版。手順・集めるログは diag2 と同じ。
+ > **diag2.2 (2026-11-03)**: LiveProcess での実行が `intentNotFound` になる問題への対策。
+-> 成果物名は `LiveContainer-guestintent-diag2.2.ipa`。下の「diag2.2 の変更」を参照。
++> **diag2.3 (2026-11-03)**: diag2.2 の A (metadata の付け直し) が試されなかった不具合の修正。
++> 成果物名は `LiveContainer-guestintent-diag2.3.ipa`。下の「diag2.3 の変更」を参照。
+ 
+ diag1 (LCGuestIntent + LiveProcess 起動) に、**ゲストを改変せずに** AlarmKit のボタンから
+ ゲスト自身の App Intent を動かす「透過ブリッジ」を足したもの。
+@@ -53,7 +54,7 @@
+ 
+ ## 手順
+ 
+-1. このフォルダを push → Actions **Build IPA (LCGuestIntent diag2.2)** → `LiveContainer-guestintent-diag2.2.ipa`
++1. このフォルダを push → Actions **Build IPA (LCGuestIntent diag2.3)** → `LiveContainer-guestintent-diag2.3.ipa`
+ 2. SideStore で上書きインストール (拡張は残す)
+ 3. **型紙を作る**: LC 内の AlarmClock v51 でアラームを 1 件登録し直す (保存するだけでよい。鳴らさなくてよい)
+    → `ファイル > LiveContainer > LCBridge > template-lcguestintent.archive` ができる
+@@ -189,3 +190,34 @@
+ 
+ diag2.1 と同じ。上書きインストールでよく、型紙も作り直さなくてよい。
+ BridgeProbe は**1 回ずつ**押す (連打すると `pid=0` になり、保留中の要求が上書きされる)。
++
++## diag2.3 の変更
++
++### diag2.2 の実測 (2026-11-03 15:18)
++
++| 項目 | 結果 |
++|---|---|
++| B: 2 つの判定 | どちらも元は YES → NO に固定できた |
++| mainBundle | `com.example.bridgeprobe`、`Metadata.appintents` あり |
++| LSBundleRecord (現在のプロセス) | `LSApplicationExtensionRecord` id=`com.kdt.livecontainer.48A5LFNW96.LiveProcess` 親=LiveContainer |
++| `bundleIdentifierForCurrentProcess` | `com.kdt.livecontainer.48A5LFNW96.LiveProcess` (拡張の ID のまま) |
++| A: ゲストのメタデータ | 読めた (actions 2 件: ProbeStopIntent, ProbeSnoozeIntent) |
++| A: 付け直し | **試されず**。`instancesRespondToSelector:` が `_initWithIdentifier:…metadata:` に NO |
++| 元のまま (B だけ効いた状態) | `intentNotFound` (22 ms) → **B だけでは足りない** |
++
++### 変更
++
++- `LCBActionWithMetadata` を 3 通りの作り方にした。どれで作れたかと、作れなかった理由を記録する
++  1. `_initWithIdentifier:…:metadata:` を `class_getInstanceMethod` の IMP で直接呼ぶ (存在確認を `instancesRespondToSelector:` に頼らない)
++  2. 複製 (`copy`) に KVC で `metadata` を入れる
++  3. `initWithMetadata:mangledTypeName:parameters:`
++- 1 のメソッドが見つからないときは、LNAction の init 系メソッドの一覧を記録する
++
++### bridge.log で見る行
++
++```
++付け直し 1: class_getInstanceMethod=… instancesRespondToSelector=…
++付け直し N で作れました
++metadata 付き: … metadata=LNActionMetadata (11BridgeProbe0B12SnoozeIntentV) …
++実行完了 [A: metadata 付き] … error=(null)   ← 成功
++```

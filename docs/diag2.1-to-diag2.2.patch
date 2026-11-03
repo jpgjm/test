@@ -1,0 +1,461 @@
+diff -ruN a/.github/workflows/build-guest-intent.yml b/.github/workflows/build-guest-intent.yml
+--- a/.github/workflows/build-guest-intent.yml	2026-11-03 05:12:47.016325386 +0000
++++ b/.github/workflows/build-guest-intent.yml	2026-11-03 05:58:47.293309539 +0000
+@@ -7,7 +7,7 @@
+ # +SideStore 版は作らない。build_github.sh が SideStore の
+ # Metadata.appintents で上書きするため、LCGuestIntent が消える。
+ 
+-name: Build IPA (LCGuestIntent diag2.1)
++name: Build IPA (LCGuestIntent diag2.2)
+ 
+ on:
+   push:
+@@ -91,13 +91,15 @@
+             echo "::error::AlarmKitBridge.m が TweakLoader.dylib に入っていません"
+             exit 1
+           fi
+-          # diag2.1: 型紙を複製する版が入ったか
+-          if strings "$app/Frameworks/TweakLoader.dylib" | grep -q "actionWithParameters:"; then
+-            echo "OK: AlarmKitBridge diag2.1 (actionWithParameters:)"
+-          else
+-            echo "::error::TweakLoader.dylib が diag2.1 の AlarmKitBridge ではありません"
+-            exit 1
+-          fi
++          # diag2.1: 型紙を複製する版 / diag2.2: 実行時のメタデータ対策が入ったか
++          for marker in "actionWithParameters:" "isAppMetadataViaXPCEnabled" "initWithBundle:usingEffectiveBundleIdentifier:error:"; do
++            if strings "$app/Frameworks/TweakLoader.dylib" | grep -q "$marker"; then
++              echo "OK: AlarmKitBridge ($marker)"
++            else
++              echo "::error::TweakLoader.dylib に $marker がありません (diag2.2 の AlarmKitBridge ではない)"
++              exit 1
++            fi
++          done
+ 
+       - name: Create IPA
+         run: |
+@@ -109,5 +111,5 @@
+       - name: Upload IPA
+         uses: actions/upload-artifact@v4
+         with:
+-          name: LiveContainer-guestintent-diag2.1.ipa
++          name: LiveContainer-guestintent-diag2.2.ipa
+           path: LiveContainer.ipa
+diff -ruN a/LiveContainer/LCGuestIntent.swift b/LiveContainer/LCGuestIntent.swift
+--- a/LiveContainer/LCGuestIntent.swift	2026-11-03 05:12:47.017265872 +0000
++++ b/LiveContainer/LCGuestIntent.swift	2026-11-03 05:56:59.511159785 +0000
+@@ -175,6 +175,13 @@
+         switch spawn {
+         case .started(let pid, let exitedAfter):
+             let exitText = exitedAfter.map { String(format: "%.1f 秒後に終了", $0) } ?? "待機時間内に終了せず"
++            // 【diag2.2】pid=0 は「completion は UUID を返したが新しい子は起動していない」。
++            //   先に起動した LiveProcess が動いている間に次の要求を出すと起きる (2026-11-03 実測)。
++            //   保留中の要求ファイル (lc.bridge) は上書きされ、次に起動した子が 120 秒以内なら拾う。
++            if pid == 0 {
++                LCGuestTrace.record("  [結果] 新しい子プロセスは起動されず (pid=0、\(exitText))。先に起動した LiveProcess が動作中の可能性")
++                return "起動されず pid=0 \(exitText)"
++            }
+             LCGuestTrace.record("  [結果] LiveProcess 起動成功 pid=\(pid) (\(exitText))。処理はゲスト側に任せる")
+             return "起動成功 pid=\(pid) \(exitText)"
+ 
+diff -ruN a/TweakLoader/AlarmKitBridge.m b/TweakLoader/AlarmKitBridge.m
+--- a/TweakLoader/AlarmKitBridge.m	2026-11-03 05:12:47.028076735 +0000
++++ b/TweakLoader/AlarmKitBridge.m	2026-11-03 05:57:59.478656392 +0000
+@@ -27,6 +27,8 @@
+ //
+ //  diag2.1: 包み替えは型紙を -[LNAction actionWithParameters:] で複製して
+ //     引数だけ差し替える。metadata と systemProtocols が型紙と同じになる。
++//  diag2.2: LiveProcess で実行するとき intentNotFound になる問題への対策
++//     (ゲストのメタデータの付け直しと、AppManager への静的メタデータの強制)。
+ //
+ //  記録先 (ゲストのコンテナ): Documents/LCBridge/bridge.log
+ //  型紙 (LiveContainer の Documents): Documents/LCBridge/template-lcguestintent.archive
+@@ -322,33 +324,188 @@
+     });
+ }
+ 
+-static void LCBRunPending(void) {
+-    NSURL *url = LCBPendingURL();
+-    NSDictionary *pending = [NSDictionary dictionaryWithContentsOfURL:url];
+-    [NSFileManager.defaultManager removeItemAtURL:url error:nil];
+-    if (!pending) return;
++#pragma mark - diag2.2: ゲストのプロセス内で Intent を見つけさせる
++//
++// diag2.1 の実測 (2026-11-03): LNAppContext の performAction が
++// AppIntents.PerformIntentError.intentNotFound で返った (9 回とも)。
++//
++// iPadOS 26.6.1 (23G83) の AppIntents を逆アセンブルして分かったこと:
++//   - LNAction に metadata が無いと「LNAction did not include metadata」と記録し、
++//     AppManager の登録表から identifier → mangledTypeName の順で探す。無ければ intentNotFound。
++//   - AppManager の表は、+[LNEntitlementsValidator currentProcessHasApplicationServiceMachLookup]
++//     かつ +[LNFeatureFlags isAppMetadataViaXPCEnabled] なら XPC で、
++//     そうでなければバンドルの Metadata.appintents から作る。
++//   - プロセスの bundle ID は +[LSBundleRecord bundleRecordForCurrentProcess] で取り、
++//     拡張なら親アプリに読み替える。LiveProcess.appex → LiveContainer になる。
++//   → 子プロセスの AppManager は LiveContainer のメタデータを引いていて、
++//     ゲストの型が載っていない、と推定 (未確認)。
++//
++// 対策 (両方入れて、どちらが効いたかはログで切り分ける):
++//   A. 実行前に、ゲスト自身の Metadata.appintents から LNActionMetadata を読み、
++//      LNAction に付け直す。
++//   B. 保留中の要求があって起こされたときだけ、上の 2 つの判定を NO にし、
++//      AppManager にゲストのバンドルから表を作らせる。
++
++static BOOL (*LCBOriginalXPCEnabled)(id, SEL);
++static BOOL (*LCBOriginalMachLookup)(id, SEL);
++static BOOL LCBForcedXPCEnabled(id self, SEL _cmd) { return NO; }
++static BOOL LCBForcedMachLookup(id self, SEL _cmd) { return NO; }
++
++/// B. AppManager に XPC ではなく静的なメタデータを使わせる。
++static void LCBForceStaticAppMetadata(void) {
++    // LinkServices はまだ読まれていないことがあるので明示的に読む (dyld 共有キャッシュ内)
++    void *handle = dlopen("/System/Library/PrivateFrameworks/LinkServices.framework/LinkServices", RTLD_NOW);
++    if (!handle) LCBLog(@"  LinkServices を読めません: %s", dlerror());
++
++    struct { NSString *cls; NSString *sel; IMP replacement; BOOL (**original)(id, SEL); } targets[] = {
++        { @"LNFeatureFlags", @"isAppMetadataViaXPCEnabled", (IMP)LCBForcedXPCEnabled, &LCBOriginalXPCEnabled },
++        { @"LNEntitlementsValidator", @"currentProcessHasApplicationServiceMachLookup", (IMP)LCBForcedMachLookup, &LCBOriginalMachLookup },
++    };
++    for (size_t i = 0; i < sizeof(targets) / sizeof(targets[0]); i++) {
++        Class cls = NSClassFromString(targets[i].cls);
++        SEL sel = NSSelectorFromString(targets[i].sel);
++        Method method = cls ? class_getClassMethod(cls, sel) : NULL;
++        if (!method) {
++            LCBLog(@"  +[%@ %@] がありません (フックしません)", targets[i].cls, targets[i].sel);
++            continue;
++        }
++        BOOL (*original)(id, SEL) = (BOOL (*)(id, SEL))method_getImplementation(method);
++        BOOL before = NO;
++        @try { before = original(cls, sel); } @catch (NSException *e) {}
++        *targets[i].original = original;
++        method_setImplementation(method, targets[i].replacement);
++        LCBLog(@"  +[%@ %@]: 元の値=%@ → NO に固定", targets[i].cls, targets[i].sel, before ? @"YES" : @"NO");
++    }
++}
+ 
+-    NSDate *date = pending[@"date"];
+-    if (![date isKindOfClass:NSDate.class] || -date.timeIntervalSinceNow > 120) {
+-        LCBLog(@"保留中の要求が古いので実行しません (%@)", date);
+-        return;
++/// このプロセスが自分を何だと思っているかを記録する。
++static void LCBDescribeProcessIdentity(void) {
++    NSBundle *main = NSBundle.mainBundle;
++    LCBLog(@"  mainBundle: id=%@ path=%@", main.bundleIdentifier, main.bundlePath);
++    NSURL *metadataURL = [main.bundleURL URLByAppendingPathComponent:@"Metadata.appintents" isDirectory:YES];
++    BOOL hasMetadata = [NSFileManager.defaultManager fileExistsAtPath:metadataURL.path];
++    LCBLog(@"  mainBundle の Metadata.appintents: %@", hasMetadata ? @"あり" : @"なし");
++
++    Class recordClass = NSClassFromString(@"LSBundleRecord");
++    SEL currentSel = NSSelectorFromString(@"bundleRecordForCurrentProcess");
++    if ([recordClass respondsToSelector:currentSel]) {
++        id record = nil;
++        @try { record = ((id (*)(id, SEL))objc_msgSend)(recordClass, currentSel); } @catch (NSException *e) {}
++        id identifier = nil, containing = nil;
++        @try { identifier = [record valueForKey:@"bundleIdentifier"]; } @catch (NSException *e) {}
++        if ([record respondsToSelector:NSSelectorFromString(@"containingBundleRecord")]) {
++            @try { containing = [[record valueForKey:@"containingBundleRecord"] valueForKey:@"bundleIdentifier"]; } @catch (NSException *e) {}
++        }
++        LCBLog(@"  LSBundleRecord (現在のプロセス): class=%@ id=%@ 親=%@",
++               record ? NSStringFromClass([record class]) : @"nil", identifier, containing ?: @"(なし)");
+     }
+ 
+-    NSData *archive = [[NSData alloc] initWithBase64EncodedString:pending[@"archive"] ?: @"" options:0];
+-    id action = archive ? LCBUnarchive(archive) : nil;
+-    if (!action) {
+-        LCBLog(@"保留中の要求を復元できません");
+-        LCBExitIfHeadless(@"復元失敗");
+-        return;
++    Class validator = NSClassFromString(@"LNEntitlementsValidator");
++    SEL bundleSel = NSSelectorFromString(@"bundleIdentifierForCurrentProcess");
++    if ([validator respondsToSelector:bundleSel]) {
++        id identifier = nil;
++        @try { identifier = ((id (*)(id, SEL))objc_msgSend)(validator, bundleSel); } @catch (NSException *e) {}
++        LCBLog(@"  +[LNEntitlementsValidator bundleIdentifierForCurrentProcess]=%@", identifier);
+     }
+-    LCBLog(@"保留中の要求を実行します");
+-    LCBDescribeAction(action, @"実行");
++}
++
++/// A. ゲスト自身の Metadata.appintents から、identifier の LNActionMetadata を読む。
++static id LCBLoadGuestActionMetadata(NSString *identifier) {
++    NSBundle *main = NSBundle.mainBundle;
++    NSURL *bundleURL = main.bundleURL;
++    NSString *bundleID = main.bundleIdentifier;
++    if (!bundleURL || !bundleID) {
++        LCBLog(@"  メタデータ: mainBundle の URL / ID がありません");
++        return nil;
++    }
++
++    // -[LNEffectiveBundleIdentifier bundleMetadataForURLs:] と同じ手順:
++    //   [[NSBundle alloc] _initUniqueWithURL:] → [[LNBundleMetadata alloc] initWithBundle:usingEffectiveBundleIdentifier:error:]
++    // type=0 は型紙 (LiveContainer = アプリ) の LNEffectiveBundleIdentifier と同じ値。
++    Class effectiveClass = NSClassFromString(@"LNEffectiveBundleIdentifier");
++    Class metadataClass = NSClassFromString(@"LNBundleMetadata");
++    SEL effectiveInit = NSSelectorFromString(@"initWithType:bundleIdentifier:url:");
++    SEL metadataInit = NSSelectorFromString(@"initWithBundle:usingEffectiveBundleIdentifier:error:");
++    if (!effectiveClass || !metadataClass ||
++        ![effectiveClass instancesRespondToSelector:effectiveInit] ||
++        ![metadataClass instancesRespondToSelector:metadataInit]) {
++        LCBLog(@"  メタデータ: LNEffectiveBundleIdentifier / LNBundleMetadata の API がありません");
++        return nil;
++    }
++    id effective = ((id (*)(id, SEL, long long, id, id))objc_msgSend)(
++        [effectiveClass alloc], effectiveInit, 0LL, bundleID, bundleURL);
++
++    NSBundle *bundle = nil;
++    SEL uniqueInit = NSSelectorFromString(@"_initUniqueWithURL:");
++    if ([NSBundle instancesRespondToSelector:uniqueInit]) {
++        bundle = ((id (*)(id, SEL, id))objc_msgSend)([NSBundle alloc], uniqueInit, bundleURL);
++    }
++    if (!bundle) bundle = main;
++
++    NSError *error = nil;
++    id metadata = nil;
++    @try {
++        metadata = ((id (*)(id, SEL, id, id, NSError **))objc_msgSend)(
++            [metadataClass alloc], metadataInit, bundle, effective, &error);
++    } @catch (NSException *e) {
++        LCBLog(@"  メタデータ: 読み込みで例外 %@", e);
++    }
++    if (!metadata) {
++        LCBLog(@"  メタデータ: 読めません error=%@", error);
++        return nil;
++    }
++
++    id actions = nil;
++    @try { actions = [metadata valueForKey:@"actions"]; } @catch (NSException *e) {}
++    NSArray *keys = [actions isKindOfClass:NSDictionary.class] ? [actions allKeys] : @[];
++    LCBLog(@"  メタデータ: actions %lu 件 [%@]", (unsigned long)keys.count, [keys componentsJoinedByString:@","]);
++    id actionMetadata = [actions isKindOfClass:NSDictionary.class] ? actions[identifier] : nil;
++    if (!actionMetadata) {
++        LCBLog(@"  メタデータ: %@ が actions にありません", identifier);
++        return nil;
++    }
++    id metaType = nil;
++    @try { metaType = [actionMetadata valueForKey:@"mangledTypeName"]; } @catch (NSException *e) {}
++    LCBLog(@"  メタデータ: %@ を見つけました (%@, mangledTypeName=%@)",
++           identifier, NSStringFromClass([actionMetadata class]), metaType);
++    return actionMetadata;
++}
++
++/// 元の LNAction に metadata を付けた複製を作る。
++/// `-[LNAction actionWithParameters:]` と同じ初期化メソッド (23G83 で確認) を使う。
++static id LCBActionWithMetadata(id action, id metadata) {
++    SEL init = NSSelectorFromString(@"_initWithIdentifier:mangledTypeName:openAppWhenRun:explicitAuthenticationPolicy:outputFlags:outputType:systemProtocols:parameters:metadata:");
++    Class actionClass = NSClassFromString(@"LNAction");
++    if (![actionClass instancesRespondToSelector:init]) {
++        LCBLog(@"  LNAction が %@ に応答しません", NSStringFromSelector(init));
++        return nil;
++    }
++    @try {
++        typedef id (*InitFunction)(id, SEL, id, id, BOOL, id, id, id, id, id, id);
++        return ((InitFunction)objc_msgSend)(
++            [actionClass alloc], init,
++            [action valueForKey:@"identifier"],
++            [action valueForKey:@"mangledTypeName"],
++            [[action valueForKey:@"openAppWhenRun"] boolValue],
++            [action valueForKey:@"explicitAuthenticationPolicy"],
++            [action valueForKey:@"outputFlags"],
++            [action valueForKey:@"outputType"],
++            [action valueForKey:@"systemProtocols"],
++            [action valueForKey:@"parameters"],
++            metadata);
++    } @catch (NSException *e) {
++        LCBLog(@"  metadata 付きの LNAction を作れません: %@", e);
++        return nil;
++    }
++}
+ 
++/// LNAppContext で 1 回実行する。completion は main キューで呼ぶ。
++static void LCBPerform(id action, NSString *label, void (^completion)(id result, NSError *error)) {
+     Class contextClass = NSClassFromString(@"LNAppContext");
+     Class optionsClass = NSClassFromString(@"LNActionExecutorOptions");
+     if (!contextClass || !optionsClass) {
+         LCBLog(@"LNAppContext / LNActionExecutorOptions がありません");
+-        LCBExitIfHeadless(@"クラスなし");
++        completion(nil, nil);
+         return;
+     }
+ 
+@@ -366,24 +523,80 @@
+     NSProgress *progress = [NSProgress progressWithTotalUnitCount:1];
+     audit_token_t token = {0};
+     NSDate *startedAt = NSDate.date;
++    LCBLog(@"実行 [%@]", label);
+ 
+     // auditToken は 32 バイトの struct。arm64 では参照渡しになるのでポインタで渡す (本家と同じ)。
+     typedef void (*PerformFunction)(id, SEL, id, id, id, id, audit_token_t *, void (^)(id, NSError *));
+     ((PerformFunction)objc_msgSend)(
+         context, NSSelectorFromString(@"performAction:options:reportingProgress:delegate:auditToken:completionHandler:"),
+         action, options, progress, nil, &token, ^(id result, NSError *error) {
+-            LCBLog(@"実行完了 (%.0f ms) result=%@ error=%@",
+-                   -startedAt.timeIntervalSinceNow * 1000, result, error);
++            LCBLog(@"実行完了 [%@] (%.0f ms) result=%@ error=%@",
++                   label, -startedAt.timeIntervalSinceNow * 1000, result, error);
+             if (error.userInfo[NSUnderlyingErrorKey]) {
+                 LCBLog(@"  下位のエラー: %@", error.userInfo[NSUnderlyingErrorKey]);
+             }
+-            LCBExitIfHeadless(@"実行完了");
++            dispatch_async(dispatch_get_main_queue(), ^{ completion(result, error); });
+         });
++}
++
++static void LCBRunPending(void) {
++    NSURL *url = LCBPendingURL();
++    NSDictionary *pending = [NSDictionary dictionaryWithContentsOfURL:url];
++    [NSFileManager.defaultManager removeItemAtURL:url error:nil];
++    if (!pending) return;
++
++    NSDate *date = pending[@"date"];
++    if (![date isKindOfClass:NSDate.class] || -date.timeIntervalSinceNow > 120) {
++        LCBLog(@"保留中の要求が古いので実行しません (%@)", date);
++        return;
++    }
++
++    NSData *archive = [[NSData alloc] initWithBase64EncodedString:pending[@"archive"] ?: @"" options:0];
++    id action = archive ? LCBUnarchive(archive) : nil;
++    if (!action) {
++        LCBLog(@"保留中の要求を復元できません");
++        LCBExitIfHeadless(@"復元失敗");
++        return;
++    }
++    LCBLog(@"保留中の要求を実行します");
++    LCBDescribeAction(action, @"実行");
++    LCBDescribeProcessIdentity();
++
++    // A. ゲスト自身のメタデータを付け直す (元の LNAction に無いときだけ)
++    id withMetadata = nil;
++    id existingMetadata = nil;
++    @try { existingMetadata = [action valueForKey:@"metadata"]; } @catch (NSException *e) {}
++    if (!existingMetadata) {
++        id actionMetadata = LCBLoadGuestActionMetadata([action valueForKey:@"identifier"]);
++        if (actionMetadata) {
++            withMetadata = LCBActionWithMetadata(action, actionMetadata);
++            if (withMetadata) LCBDescribeAction(withMetadata, @"metadata 付き");
++        }
++    }
+ 
+     // 完了が来ない場合の保険
+     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+         LCBExitIfHeadless(@"25 秒で完了しない");
+     });
++
++    // 1 回目: metadata 付き (作れたとき)。失敗したら 2 回目: 元のまま。
++    // どちらにも B (静的メタデータの強制) は効いているので、
++    // 「1 回目だけ成功」なら A が、「2 回目も成功」なら B が効いたことになる。
++    if (withMetadata) {
++        LCBPerform(withMetadata, @"A: metadata 付き", ^(id result, NSError *error) {
++            if (!error) {
++                LCBExitIfHeadless(@"実行完了");
++                return;
++            }
++            LCBPerform(action, @"元のまま", ^(id result2, NSError *error2) {
++                LCBExitIfHeadless(@"実行完了");
++            });
++        });
++    } else {
++        LCBPerform(action, @"元のまま", ^(id result, NSError *error) {
++            LCBExitIfHeadless(@"実行完了");
++        });
++    }
+ }
+ 
+ #pragma mark - 入口
+@@ -399,6 +612,8 @@
+ 
+     if (getenv("LP_HOME_PATH") && [NSFileManager.defaultManager fileExistsAtPath:LCBPendingURL().path]) {
+         LCBLog(@"保留中の要求があります。起動完了を待って実行します");
++        // B. AppManager が初期化される前に (ゲストの main より前) 判定を差し替える
++        LCBForceStaticAppMetadata();
+         [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidFinishLaunchingNotification
+                                                         object:nil
+                                                          queue:NSOperationQueue.mainQueue
+diff -ruN a/docs/AlarmKitBridge-diag2.md b/docs/AlarmKitBridge-diag2.md
+--- a/docs/AlarmKitBridge-diag2.md	2026-11-03 05:12:47.029179625 +0000
++++ b/docs/AlarmKitBridge-diag2.md	2026-11-03 05:58:47.294318218 +0000
+@@ -1,7 +1,8 @@
+-# AlarmKitBridge 検証版 (diag2 / diag2.1)
++# AlarmKitBridge 検証版 (diag2 / diag2.1 / diag2.2)
+ 
+-> **diag2.1 (2026-11-03)**: 包み替えの作り方だけを変えた版。手順・集めるログは diag2 と同じ
+-> (成果物名が `LiveContainer-guestintent-diag2.1.ipa` になる)。下の「diag2.1 の変更」を参照。
++> **diag2.1 (2026-11-03)**: 包み替えの作り方だけを変えた版。手順・集めるログは diag2 と同じ。
++> **diag2.2 (2026-11-03)**: LiveProcess での実行が `intentNotFound` になる問題への対策。
++> 成果物名は `LiveContainer-guestintent-diag2.2.ipa`。下の「diag2.2 の変更」を参照。
+ 
+ diag1 (LCGuestIntent + LiveProcess 起動) に、**ゲストを改変せずに** AlarmKit のボタンから
+ ゲスト自身の App Intent を動かす「透過ブリッジ」を足したもの。
+@@ -52,7 +53,7 @@
+ 
+ ## 手順
+ 
+-1. このフォルダを push → Actions **Build IPA (LCGuestIntent diag2.1)** → `LiveContainer-guestintent-diag2.1.ipa`
++1. このフォルダを push → Actions **Build IPA (LCGuestIntent diag2.2)** → `LiveContainer-guestintent-diag2.2.ipa`
+ 2. SideStore で上書きインストール (拡張は残す)
+ 3. **型紙を作る**: LC 内の AlarmClock v51 でアラームを 1 件登録し直す (保存するだけでよい。鳴らさなくてよい)
+    → `ファイル > LiveContainer > LCBridge > template-lcguestintent.archive` ができる
+@@ -126,3 +127,65 @@
+ 
+ Info.plist と entitlements は変えていない。**上書きインストールで検証できる。** 型紙も作り直さなくてよい
+ (diag2 で作った `template-lcguestintent.archive` をそのまま使う)。
++
++## diag2.2 の変更
++
++### diag2.1 の実測 (2026-11-03 14:27)
++
++| 段 | 結果 |
++|---|---|
++| A〜D (包み替え・解決・起動) | ○ |
++| E. 実行 | × `LNAppContext performAction` → `AppIntents.PerformIntentError.intentNotFound` (9 回とも、12〜62 ms) |
++| F. 結果 | × `bridge-probe.log` に ★ 行なし |
++
++### 原因 (23G83 の AppIntents を逆アセンブル)
++
++- [検証] LNAction に `metadata` が無いと「LNAction did not include metadata」と記録し、AppManager の登録表から
++  identifier → mangledTypeName の順で探す。無ければ intentNotFound
++- [検証] AppManager の表は `+[LNEntitlementsValidator currentProcessHasApplicationServiceMachLookup]` かつ
++  `+[LNFeatureFlags isAppMetadataViaXPCEnabled]` なら XPC で、そうでなければバンドルの `Metadata.appintents` から作る
++- [検証] プロセスの bundle ID は `+[LSBundleRecord bundleRecordForCurrentProcess]` で取り、拡張なら親アプリに読み替える
++  (LiveProcess.appex → LiveContainer)
++- [推論] 子プロセスの AppManager は LiveContainer のメタデータを引いていて、ゲストの型が載っていない
++- 元の LNAction に metadata が無いのは、登録時に AlarmKit が LiveContainer のプロセスで LNAction を作るため
++  (BridgeProbe の型は LiveContainer のメタデータに無い)
++
++### 対策 (TweakLoader/AlarmKitBridge.m)
++
++| | 内容 | いつ |
++|---|---|---|
++| A | ゲスト自身の `Metadata.appintents` を `LNBundleMetadata initWithBundle:usingEffectiveBundleIdentifier:error:` で読み、`actions[identifier]` を LNAction に付け直す (`_initWithIdentifier:…:metadata:`) | 実行直前 |
++| B | `isAppMetadataViaXPCEnabled` と `currentProcessHasApplicationServiceMachLookup` を NO に固定し、AppManager にバンドルの静的メタデータを使わせる | 保留中の要求があって LiveProcess で起こされたときだけ。ゲストの main より前 |
++
++実行は「A: metadata 付き」→ 失敗したら「元のまま」の順に 1 回ずつ。B はどちらにも効いている。
++
++| 結果 | 意味 |
++|---|---|
++| A が成功 | metadata の付け直しで足りる (B が要るかは次の版で B を外して確かめる) |
++| A が失敗・元のまま が成功 | B が効いた。A の付け直し方に問題がある |
++| 両方失敗 | 下の診断行から、AppManager がどのバンドルを見ているかを確かめる |
++
++### bridge.log に増えた行
++
++```
+++[LNFeatureFlags isAppMetadataViaXPCEnabled]: 元の値=… → NO に固定
+++[LNEntitlementsValidator currentProcessHasApplicationServiceMachLookup]: 元の値=… → NO に固定
++mainBundle: id=… path=…
++mainBundle の Metadata.appintents: あり / なし
++LSBundleRecord (現在のプロセス): class=… id=… 親=…
+++[LNEntitlementsValidator bundleIdentifierForCurrentProcess]=…
++メタデータ: actions N 件 [...]
++メタデータ: ProbeSnoozeIntent を見つけました (LNActionMetadata, mangledTypeName=…)
++実行 [A: metadata 付き] / 実行完了 [A: metadata 付き] … error=…
++実行 [元のまま] / 実行完了 [元のまま] … error=…
++```
++
++### その他
++
++- `LiveContainer/LCGuestIntent.swift`: 新しい子が起動しなかったとき (`pid=0`) を「起動成功」ではなく
++  「新しい子プロセスは起動されず」と記録するようにした (処理の流れは変えていない)
++
++### 手順
++
++diag2.1 と同じ。上書きインストールでよく、型紙も作り直さなくてよい。
++BridgeProbe は**1 回ずつ**押す (連打すると `pid=0` になり、保留中の要求が上書きされる)。

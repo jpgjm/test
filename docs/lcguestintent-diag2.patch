@@ -1,0 +1,1420 @@
+diff --git a/.github/workflows/build-guest-intent.yml b/.github/workflows/build-guest-intent.yml
+new file mode 100644
+index 0000000..933a557
+--- /dev/null
++++ b/.github/workflows/build-guest-intent.yml
+@@ -0,0 +1,106 @@
++# LCGuestIntent 検証版のビルド。
++#
++# 本家の build.yml は submodule がそろっている前提で、ZIP から作った
++# リポジトリでは失敗する。こちらは submodule を固定 SHA で取り直してから
++# ビルドし、素の LiveContainer.ipa だけを作る。
++#
++# +SideStore 版は作らない。build_github.sh が SideStore の
++# Metadata.appintents で上書きするため、LCGuestIntent が消える。
++
++name: Build IPA (LCGuestIntent diag2)
++
++on:
++  push:
++    branches: [main, master]
++  workflow_dispatch:
++
++jobs:
++  build:
++    runs-on: macos-latest
++    env:
++      scheme: LiveContainer
++      archive_path: archive
++    steps:
++      - uses: maxim-lobanov/setup-xcode@v1
++        with:
++          xcode-version: '26.2'
++
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      # 本家 main (9108ae62, 2026-10-17) の gitlink と同じ SHA。
++      # fishhook は .gitmodules に残っているだけで、ツリーにもプロジェクトにも無い。
++      - name: Restore submodules
++        run: |
++          set -euo pipefail
++          restore() {
++            local path="$1" url="$2" sha="$3"
++            if [ -d "$path" ] && [ -n "$(ls -A "$path" 2>/dev/null)" ]; then
++              echo "$path: 既にあります"
++              return
++            fi
++            rm -rf "$path"
++            git init -q "$path"
++            git -C "$path" remote add origin "$url"
++            git -C "$path" fetch -q --depth 1 origin "$sha"
++            git -C "$path" checkout -q FETCH_HEAD
++            echo "$path: $(git -C "$path" rev-parse HEAD)"
++          }
++          restore OpenSSL  https://github.com/krzyzanowskim/OpenSSL   623c84da314e85363236507ca38a4bde65df21c3
++          restore litehook https://github.com/LiveContainer/litehook  a7e9f599d7f0b3d77008ad62bf10cb10dab6eca9
++
++      - name: Archive
++        run: |
++          set -o pipefail
++          xcodebuild archive \
++            -archivePath "$archive_path" \
++            -scheme "$scheme" \
++            -project LiveContainer.xcodeproj \
++            -sdk iphoneos -arch arm64 -configuration Release \
++            | tee xcodebuild.log | xcpretty
++
++      - name: Upload build log
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: xcodebuild.log
++          path: xcodebuild.log
++          if-no-files-found: ignore
++
++      # LCGuestIntent がメタデータに入っていなければ、AlarmKit から解決されない。
++      - name: Inspect AppIntents metadata
++        run: |
++          set -euo pipefail
++          app="$archive_path.xcarchive/Products/Applications/LiveContainer.app"
++          meta="$app/Metadata.appintents"
++          ls -la "$meta"
++          data="$meta/extract.actionsdata"
++          for id in com.kdt.livecontainer.guestIntent LCGuestProbeIntent; do
++            if grep -q "$id" "$data"; then
++              echo "OK: $id"
++            else
++              echo "::error::$id が Metadata.appintents にありません"
++              exit 1
++            fi
++          done
++          ls "$app/PlugIns" || true
++          # diag2: AlarmKitBridge.m が TweakLoader に入ったか (同期フォルダは自動では入らない)
++          if strings "$app/Frameworks/TweakLoader.dylib" | grep -q "template-lcguestintent.archive"; then
++            echo "OK: AlarmKitBridge (TweakLoader.dylib)"
++          else
++            echo "::error::AlarmKitBridge.m が TweakLoader.dylib に入っていません"
++            exit 1
++          fi
++
++      - name: Create IPA
++        run: |
++          set -euo pipefail
++          mv "$archive_path.xcarchive/Products/Applications" Payload
++          zip -qr "$scheme.ipa" Payload -x "._*" -x ".DS_Store" -x "__MACOSX"
++          ls -la "$scheme.ipa"
++
++      - name: Upload IPA
++        uses: actions/upload-artifact@v4
++        with:
++          name: LiveContainer-guestintent-diag2.ipa
++          path: LiveContainer.ipa
+diff --git a/LiveContainer.xcodeproj/project.pbxproj b/LiveContainer.xcodeproj/project.pbxproj
+index e5d705c..1aedb74 100644
+--- a/LiveContainer.xcodeproj/project.pbxproj
++++ b/LiveContainer.xcodeproj/project.pbxproj
+@@ -30,6 +30,7 @@
+ 		E1292C0A2DCA43540065E12D /* utils.m in Sources */ = {isa = PBXBuildFile; fileRef = 172CA85E2D9D721700CF6989 /* utils.m */; };
+ 		E1292C0B2DCA43560065E12D /* LCBootstrap.m in Sources */ = {isa = PBXBuildFile; fileRef = 172CA85A2D9D721700CF6989 /* LCBootstrap.m */; };
+ 		E1292C132DCA46070065E12D /* main.c in Sources */ = {isa = PBXBuildFile; fileRef = E1292C032DCA3C160065E12D /* main.c */; };
++		4C47A1E12FA0000100A1B2C3 /* LCGuestIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C47A1E02FA0000100A1B2C3 /* LCGuestIntent.swift */; };
+ 		E16D95742E1CD2980068EB63 /* LCMachOUtils.m in Sources */ = {isa = PBXBuildFile; fileRef = E16D94DE2E1CC8200068EB63 /* LCMachOUtils.m */; };
+ 		E16D95752E1CD2B90068EB63 /* LiveContainerShared.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = E1292BD62DCA3B660065E12D /* LiveContainerShared.framework */; };
+ 		E1946AD83041BFF8005CBEDD /* IOKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = E1946AD63041BFDD005CBEDD /* IOKit.framework */; };
+@@ -182,6 +183,7 @@
+ 		E1292AE52DCA3A660065E12D /* LiveProcess.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = LiveProcess.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+ 		E1292BD62DCA3B660065E12D /* LiveContainerShared.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = LiveContainerShared.framework; sourceTree = BUILT_PRODUCTS_DIR; };
+ 		E1292C032DCA3C160065E12D /* main.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = main.c; sourceTree = "<group>"; };
++		4C47A1E02FA0000100A1B2C3 /* LCGuestIntent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LCGuestIntent.swift; sourceTree = "<group>"; };
+ 		E16D94DE2E1CC8200068EB63 /* LCMachOUtils.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = LCMachOUtils.m; sourceTree = "<group>"; };
+ 		E16D95762E1CD49E0068EB63 /* LCMachOUtils.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = LCMachOUtils.h; sourceTree = "<group>"; };
+ 		E16D9BA02E1D48DE0068EB63 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
+@@ -213,6 +215,7 @@
+ 		174140F52D9C1C9B00F3F928 /* PBXFileSystemSynchronizedBuildFileExceptionSet */ = {
+ 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+ 			membershipExceptions = (
++				AlarmKitBridge.m,
+ 				DocumentPicker.m,
+ 				Notification.m,
+ 				TweakLoader.m,
+@@ -414,6 +417,7 @@
+ 			children = (
+ 				E16D95762E1CD49E0068EB63 /* LCMachOUtils.h */,
+ 				E1292C032DCA3C160065E12D /* main.c */,
++				4C47A1E02FA0000100A1B2C3 /* LCGuestIntent.swift */,
+ 				E1292C1A2DCA48F00065E12D /* Tweaks */,
+ 				E11884B82EF7A15F009C6FA6 /* dyld_bypass_validation.h */,
+ 				172CA8542D9D721700CF6989 /* dyld_bypass_validation.m */,
+@@ -993,6 +997,7 @@
+ 			buildActionMask = 2147483647;
+ 			files = (
+ 				E1292C132DCA46070065E12D /* main.c in Sources */,
++				4C47A1E12FA0000100A1B2C3 /* LCGuestIntent.swift in Sources */,
+ 			);
+ 			runOnlyForDeploymentPostprocessing = 0;
+ 		};
+diff --git a/LiveContainer/LCGuestIntent.swift b/LiveContainer/LCGuestIntent.swift
+new file mode 100644
+index 0000000..a19301d
+--- /dev/null
++++ b/LiveContainer/LCGuestIntent.swift
+@@ -0,0 +1,702 @@
++//
++//  LCGuestIntent.swift
++//  LiveContainer
++//
++//  ゲストアプリのための汎用 App Intent と、その検証用プローブ。
++//
++//  ── 何のためのファイルか ────────────────────────────────────────
++//
++//  ゲストが宣言した App Intents はシステムに登録されない。AlarmKit は
++//  アラームを登録したアプリ (= LiveContainer) のメタデータからしか
++//  stopIntent / secondaryIntent を解決しないため、ゲストのコードを
++//  ボタンから動かす手段がない。
++//
++//  そこで LiveContainer が `LiveActivityIntent` を 1 つだけ静的に宣言し、
++//  `persistentIdentifier` を固定する。ゲストは構造の一致するスタブを
++//  渡すだけでよい (一致が必要なのは persistentIdentifier だけ)。
++//
++//  ── この版で検証すること ────────────────────────────────────────
++//
++//  これまで「背面のアプリからは LiveProcess.appex (NSExtension) を
++//  起動できない」と結論していたが、根拠は「completion が nil UUID で
++//  返り、理由の通知もない」ことだけだった。
++//
++//  iPadOS 26.6.1 の ExtensionFoundation を逆アセンブルした結果、
++//  `-[EXConcreteExtension _beginExtensionRequest:completion:]` は失敗時に
++//  **completion(nil, error)** と 2 引数で呼んでいる。LiveContainer の
++//  `FoundationPrivate.h` を含め、これまでのコードは completion を
++//  1 引数で宣言していたため、エラーを受け取れていなかった。
++//
++//  この版は completion を (NSUUID?, NSError?) で受け、エラーを
++//  NSUnderlyingError までたどって記録する。呼び出し元・ロック状態・
++//  RunningBoard の状態も同時に残し、失敗の原因を切り分ける。
++//
++//  ── 流れ ────────────────────────────────────────────────────────
++//
++//    1. 環境を記録 (呼び出し元 / applicationState / ロック状態 / RBS 状態)
++//    2. payload の documents からゲストを特定し、LiveProcess.appex で
++//       画面を出さずに起動を試みる (成功したらゲスト側が自分で処理する)
++//    3. 起動に失敗したら、従来どおり Tweaks で読み込まれた dylib の
++//       シンボル (handler) をこのプロセスで呼ぶ。機能は失われない
++//
++//  同じ処理を通常の AppIntent (`LCGuestProbeIntent`) からも呼べるので、
++//  ショートカットから実行して「Intent の種類」による差を比べられる。
++//
++//  記録先: ファイル > LiveContainer > lc-guest-intent.log
++//  (AlarmHandler.dylib の記録と同じファイルに時系列で並ぶ)
++//
++
++import AppIntents
++import Foundation
++import UIKit
++
++// MARK: - AlarmKit などから呼ばれる汎用 Intent
++
++@available(iOS 17.0, *)
++struct LCGuestIntent: LiveActivityIntent {
++
++    static var title: LocalizedStringResource = "LiveContainer Guest Action"
++
++    static var description = IntentDescription(
++        "Runs an action on behalf of a guest app. Guests pass a stub with the same persistent identifier."
++    )
++
++    /// ショートカットには出さない。システム API から渡されるためのもの。
++    static var isDiscoverable: Bool = false
++
++    /// 前面に出さない。
++    static var openAppWhenRun: Bool = false
++
++    /// ゲスト側スタブとの唯一の接点。変更しないこと。
++    static var persistentIdentifier: String { "com.kdt.livecontainer.guestIntent" }
++
++    // ゲスト側スタブ (AlarmClock の LCGuestIntentStub.swift) と
++    // 名前・型・宣言順を完全に一致させること。
++
++    /// Tweaks で読み込まれた dylib の C シンボル名。
++    @Parameter(title: "Handler Symbol")
++    var handler: String
++
++    /// ゲストに渡す任意の文字列。LiveContainer は解釈しない。
++    @Parameter(title: "Action")
++    var action: String
++
++    /// ゲストに渡す任意の文字列。`documents` キーだけはゲストの特定に使う。
++    @Parameter(title: "Payload")
++    var payload: String
++
++    init() {
++        self.handler = ""
++        self.action = ""
++        self.payload = ""
++    }
++
++    init(handler: String, action: String = "", payload: String = "") {
++        self.handler = handler
++        self.action = action
++        self.payload = payload
++    }
++
++    func perform() async throws -> some IntentResult {
++        let request = LCGuestRequest(handler: handler, action: action, payload: payload)
++        request.saveAsLast()
++        _ = await LCGuestBridge.run(request, source: "LiveActivityIntent (AlarmKit など)")
++        return .result()
++    }
++}
++
++// MARK: - 比較用の通常 Intent (ショートカットから実行する)
++
++/// `LCGuestIntent` と同じ処理を、通常の AppIntent として実行する。
++///
++/// LinkServices は `LiveActivityIntent` の実行時だけ専用のアサーション
++/// (SessionAssertion) を使う。Intent の種類で LiveProcess の起動可否が
++/// 変わるかを比べるために置いている。
++///
++/// 直前に `LCGuestIntent` が受け取った handler / action / payload を使う。
++/// 先に一度アラームの停止ボタンを押しておくこと。
++@available(iOS 17.0, *)
++struct LCGuestProbeIntent: AppIntent {
++
++    static var title: LocalizedStringResource = "Guest Probe (LiveContainer)"
++
++    static var description = IntentDescription(
++        "Diagnostic: replays the last guest action as a regular App Intent and returns the log summary."
++    )
++
++    static var openAppWhenRun: Bool = false
++
++    func perform() async throws -> some IntentResult & ReturnsValue<String> {
++        guard let request = LCGuestRequest.loadLast() else {
++            LCGuestTrace.record("[Probe] 直前の要求がありません。先にアラームの停止ボタンを押してください")
++            return .result(value: "直前の要求がありません。先にアラームの停止ボタンを押してください。")
++        }
++        let summary = await LCGuestBridge.run(request, source: "AppIntent (ショートカット)")
++        return .result(value: summary)
++    }
++}
++
++// MARK: - 要求
++
++@available(iOS 17.0, *)
++struct LCGuestRequest: Codable {
++    var handler: String
++    var action: String
++    var payload: String
++
++    private static let defaultsKey = "LCGuestIntentLastRequest"
++
++    func saveAsLast() {
++        if let data = try? JSONEncoder().encode(self) {
++            UserDefaults.standard.set(data, forKey: Self.defaultsKey)
++        }
++    }
++
++    static func loadLast() -> LCGuestRequest? {
++        guard let data = UserDefaults.standard.data(forKey: defaultsKey) else { return nil }
++        return try? JSONDecoder().decode(LCGuestRequest.self, from: data)
++    }
++}
++
++// MARK: - 本体
++
++@available(iOS 17.0, *)
++enum LCGuestBridge {
++
++    /// - Returns: 結果の 1 行要約 (ショートカットに返す)
++    static func run(_ request: LCGuestRequest, source: String) async -> String {
++        LCGuestTrace.record("──── 呼び出し元: \(source)")
++        LCGuestTrace.record("  handler=\(request.handler) action=\(request.action)")
++        await LCGuestEnvironment.record()
++
++        // 1. LiveProcess での起動を試す
++        let spawn = await LCGuestSpawner.spawn(for: request)
++
++        switch spawn {
++        case .started(let pid, let exitedAfter):
++            let exitText = exitedAfter.map { String(format: "%.1f 秒後に終了", $0) } ?? "待機時間内に終了せず"
++            LCGuestTrace.record("  [結果] LiveProcess 起動成功 pid=\(pid) (\(exitText))。処理はゲスト側に任せる")
++            return "起動成功 pid=\(pid) \(exitText)"
++
++        case .failed(let reason):
++            LCGuestTrace.record("  [結果] LiveProcess 起動失敗: \(reason)")
++            // 2. 従来の経路で処理する (機能を失わないため)
++            let inProcess = callInProcessHandler(request)
++            return "起動失敗: \(reason) / プロセス内ハンドラ: \(inProcess)"
++
++        case .skipped(let reason):
++            LCGuestTrace.record("  [結果] LiveProcess 起動を省略: \(reason)")
++            let inProcess = callInProcessHandler(request)
++            return "起動省略: \(reason) / プロセス内ハンドラ: \(inProcess)"
++        }
++    }
++
++    /// Tweaks で読み込まれた dylib のエントリを `RTLD_DEFAULT` から引いて呼ぶ。
++    /// これまでの方式 (v48 以降) と同じ。
++    private static func callInProcessHandler(_ request: LCGuestRequest) -> String {
++        guard !request.handler.isEmpty else {
++            LCGuestTrace.record("  プロセス内ハンドラ: handler が空なので呼びません")
++            return "handler なし"
++        }
++        let rtldDefault = UnsafeMutableRawPointer(bitPattern: -2)
++        guard let symbol = dlsym(rtldDefault, request.handler) else {
++            LCGuestTrace.record("  プロセス内ハンドラ: \(request.handler) が見つかりません (Tweaks の読み込みを確認)")
++            return "シンボルなし"
++        }
++        typealias Entry = @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Int32
++        let entry = unsafeBitCast(symbol, to: Entry.self)
++        let result = request.action.withCString { actionPtr in
++            request.payload.withCString { payloadPtr in
++                entry(actionPtr, payloadPtr)
++            }
++        }
++        LCGuestTrace.record("  プロセス内ハンドラ: \(request.handler) result=\(result)")
++        return "result=\(result)"
++    }
++}
++
++// MARK: - 環境の記録
++
++@available(iOS 17.0, *)
++enum LCGuestEnvironment {
++
++    static func record() async {
++        let (state, protectedData) = await MainActor.run { () -> (String, Bool) in
++            let app = UIApplication.shared
++            let stateText: String
++            switch app.applicationState {
++            case .active: stateText = "active"
++            case .inactive: stateText = "inactive"
++            case .background: stateText = "background"
++            @unknown default: stateText = "unknown"
++            }
++            return (stateText, app.isProtectedDataAvailable)
++        }
++        LCGuestTrace.record("  pid=\(getpid()) applicationState=\(state) "
++                            + "ロック=\(protectedData ? "解除中 (保護データ利用可)" : "ロック中 (保護データ利用不可)")")
++        LCGuestTrace.record("  RBS状態: \(runningBoardState())")
++    }
++
++    /// RunningBoard から見た自分の状態 (アサーション・制限)。
++    /// 私的 API なので、応答しない場合は何もしない。
++    private static func runningBoardState() -> String {
++        guard let handleClass = NSClassFromString("RBSProcessHandle") as AnyObject? else {
++            return "(RBSProcessHandle なし)"
++        }
++        guard let current = LCObjC.get(handleClass, "currentProcess") else {
++            return "(currentProcess を取得できません)"
++        }
++        var parts: [String] = []
++        if let state = LCObjC.get(current, "currentState") {
++            parts.append(LCObjC.compact(String(describing: state), limit: 900))
++        }
++        if let limitations = LCObjC.get(current, "activeLimitations") {
++            parts.append("limitations=" + LCObjC.compact(String(describing: limitations), limit: 300))
++        }
++        return parts.isEmpty ? "(取得できません)" : parts.joined(separator: " | ")
++    }
++}
++
++// MARK: - LiveProcess の起動
++
++/// `NSExtension` の私的 API。
++///
++/// LiveContainer アプリターゲットは LiveContainerShared をリンクしていない
++/// (main.c が dlopen する) ので、ヘッダを使わず @objc プロトコルで呼ぶ。
++///
++/// 【重要】completion は (NSUUID?, NSError?) の 2 引数。
++///   ExtensionFoundation は失敗時に completion(nil, error) と呼ぶ。
++///   1 引数で宣言するとエラーが捨てられる (これまでの原因不明の正体)。
++@objc private protocol LCNSExtensionShim {
++    @objc var preferredLanguages: [String] { get set }
++    @objc(beginExtensionRequestWithInputItems:completion:)
++    func lcBegin(items: [Any], completion: ((NSUUID?, NSError?) -> Void)?)
++    @objc(pidForRequestIdentifier:)
++    func lcPid(for identifier: NSUUID) -> Int32
++    @objc(setRequestCancellationBlock:)
++    func lcSetCancellation(_ block: ((NSUUID?, NSError?) -> Void)?)
++    @objc(setRequestInterruptionBlock:)
++    func lcSetInterruption(_ block: ((NSUUID?) -> Void)?)
++    @objc(_kill:)
++    func lcKill(_ signal: Int32)
++}
++
++/// `+[NSExtension extensionWithIdentifier:error:]` をエラー付きで呼ぶため。
++@objc private protocol LCNSExtensionFactoryShim {
++    @objc(extensionWithIdentifier:error:)
++    func lcExtension(identifier: String, error: NSErrorPointer) -> AnyObject?
++}
++
++@available(iOS 17.0, *)
++enum LCGuestSpawnResult {
++    /// 起動できた。`exitedAfter` は子プロセスが終了するまでの秒数 (待機時間内に終われば)。
++    case started(pid: Int32, exitedAfter: Double?)
++    case failed(String)
++    case skipped(String)
++}
++
++@available(iOS 17.0, *)
++enum LCGuestSpawner {
++
++    /// 起動した NSExtension を保持する。解放されるとリクエストごと取り消される。
++    private static var held: [AnyObject] = []
++    private static let heldLock = NSLock()
++
++    /// security-scoped bookmark (本家 AppSceneViewController.m と同じ値)
++    private static let bookmarkOptions = URL.BookmarkCreationOptions(rawValue: 1 << 11)
++
++    /// completion を待つ秒数。
++    private static let beginTimeout: Double = 8
++    /// 起動成功後、子プロセスの終了 (interruption) を待つ秒数。
++    /// LiveActivityIntent の実行時間には上限があるので長くしない。
++    private static let exitWaitTimeout: Double = 15
++
++    static func spawn(for request: LCGuestRequest) async -> LCGuestSpawnResult {
++
++        // --- 1. ゲストを特定する --------------------------------------
++        //
++        // 【diag2】action == "lc.bridge" は TweakLoader (AlarmKitBridge.m) が
++        //   ゲスト自身の Intent を包み替えたもの。payload にゲストの場所と
++        //   元の LNAction (保存形式) が入っている。元の LNAction はゲストの
++        //   コンテナに「保留中の要求」として置き、起こしたゲストに実行させる。
++        let target: LCGuestTarget
++        if request.action == LCGuestBridgeRequest.action {
++            guard let bridge = LCGuestBridgeRequest(payload: request.payload) else {
++                return .skipped("lc.bridge の payload を読めません")
++            }
++            LCGuestTrace.record("  包み替えられた Intent: \(bridge.origin) (保存形式 \(bridge.archiveBase64.count) 文字)")
++            guard let bridgeTarget = bridge.writePending() else {
++                return .failed("保留中の要求を書き込めません")
++            }
++            target = bridgeTarget
++        } else {
++            guard let located = LCGuestLocator.locate(payload: request.payload) else {
++                return .skipped("payload からゲストを特定できません")
++            }
++            target = located
++        }
++        LCGuestTrace.record("  ゲスト: \(target.bundleFolder) コンテナ: \(target.container)")
++
++        // --- 2. LiveProcess.appex を用意する ---------------------------
++        guard let pluginsURL = Bundle.main.builtInPlugInsURL,
++              let liveProcessBundle = Bundle(url: pluginsURL.appendingPathComponent("LiveProcess.appex")),
++              let liveProcessID = liveProcessBundle.bundleIdentifier else {
++            return .skipped("LiveProcess.appex がありません (インストール時に拡張が削除された可能性)")
++        }
++
++        guard let extensionClass = NSClassFromString("NSExtension") else {
++            return .failed("NSExtension クラスがありません")
++        }
++        let factory = unsafeBitCast(extensionClass as AnyObject, to: LCNSExtensionFactoryShim.self)
++        var createError: NSError?
++        guard let extObject = factory.lcExtension(identifier: liveProcessID, error: &createError) else {
++            LCGuestErrorDump.record(createError, label: "extensionWithIdentifier のエラー")
++            return .failed("NSExtension を生成できません (\(liveProcessID))")
++        }
++        heldLock.lock(); held.append(extObject); heldLock.unlock()
++
++        let ext = unsafeBitCast(extObject, to: LCNSExtensionShim.self)
++        ext.preferredLanguages = []
++
++        // --- 3. userInfo (本家 AppSceneViewController.m と同じキー) ------
++        let bookmarks = makeBookmarks(target)
++        var userInfo: [String: Any] = [
++            "selected": target.bundleFolder,
++            "selectedContainer": target.container,
++            "bookmarks": bookmarks,
++            "lcHomePath": NSHomeDirectory(),
++        ]
++        if let scheme = LCGuestLocator.hostURLScheme() {
++            userInfo["hostUrlScheme"] = scheme
++        }
++        let item = NSExtensionItem()
++        item.userInfo = userInfo
++        LCGuestTrace.record("  起動要求: \(liveProcessID) scheme=\(userInfo["hostUrlScheme"] ?? "(なし)") bookmarks=\(bookmarks.count)")
++
++        // --- 4. 起動する -----------------------------------------------
++        let outcome = LCGuestSpawnOutcome()
++        ext.lcSetCancellation { _, error in outcome.markCancelled(error) }
++        ext.lcSetInterruption { _ in outcome.markInterrupted() }
++
++        let startedAt = Date()
++        ext.lcBegin(items: [item]) { uuid, error in
++            outcome.markCompleted(uuid: uuid, error: error)
++        }
++
++        await waitUntil(timeout: beginTimeout) { outcome.completed || outcome.cancelled }
++
++        let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
++
++        guard let uuid = outcome.uuid else {
++            // 失敗。エラーをすべて記録する。
++            if outcome.completed {
++                LCGuestTrace.record("  completion: UUID=nil (\(elapsedMs) ms)")
++            } else {
++                LCGuestTrace.record("  completion が \(Int(beginTimeout)) 秒以内に返りません")
++            }
++            LCGuestErrorDump.record(outcome.completionError, label: "completion のエラー")
++            // cancellation が遅れて届くことがあるので少しだけ待つ
++            await waitUntil(timeout: 2) { outcome.cancelled }
++            if outcome.cancelled {
++                LCGuestErrorDump.record(outcome.cancellationError, label: "cancellation のエラー")
++            }
++            ext.lcKill(9)
++            release(extObject)
++            let code = outcome.completionError.map { "\($0.domain) code=\($0.code)" } ?? "エラーなし"
++            return .failed("UUID=nil [\(code)]")
++        }
++
++        let pid = ext.lcPid(for: uuid)
++        LCGuestTrace.record("  completion: 起動しました pid=\(pid) (\(elapsedMs) ms)")
++
++        // --- 5. 子プロセスの終了を待つ (ゲストは処理後に exit する) -------
++        await waitUntil(timeout: exitWaitTimeout) { outcome.interrupted || outcome.cancelled }
++        if outcome.cancelled {
++            LCGuestErrorDump.record(outcome.cancellationError, label: "起動後の cancellation")
++        }
++        let exitedAfter: Double? = (outcome.interrupted || outcome.cancelled)
++            ? Date().timeIntervalSince(startedAt) : nil
++        if exitedAfter == nil {
++            LCGuestTrace.record("  子プロセスは \(Int(exitWaitTimeout)) 秒以内に終了しませんでした (保持を解放します)")
++        }
++        release(extObject)
++        return .started(pid: pid, exitedAfter: exitedAfter)
++    }
++
++    private static func makeBookmarks(_ target: LCGuestTarget) -> [Data] {
++        let home = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
++        let documents = home.appendingPathComponent("Documents", isDirectory: true)
++        let candidates: [(String, URL)] = [
++            ("アプリ", target.appURL),
++            ("コンテナ", documents.appendingPathComponent("Data/Application/\(target.container)", isDirectory: true)),
++            ("Tweaks", documents.appendingPathComponent("Tweaks", isDirectory: true)),
++            // AlarmKit のカスタム音源はホストの Library/Sounds から読まれる。
++            // ゲストがここを書き換えられるように渡す。
++            ("Library/Sounds", home.appendingPathComponent("Library/Sounds", isDirectory: true)),
++        ]
++        var result: [Data] = []
++        for (label, url) in candidates {
++            guard FileManager.default.fileExists(atPath: url.path) else {
++                LCGuestTrace.record("  bookmark 省略: \(label) (存在しません)")
++                continue
++            }
++            // nil を渡すと LiveProcess 側が配列に nil を入れて落ちるので必ず除く
++            guard let data = try? url.bookmarkData(options: bookmarkOptions,
++                                                   includingResourceValuesForKeys: nil,
++                                                   relativeTo: nil) else {
++                LCGuestTrace.record("  bookmark 失敗: \(label)")
++                continue
++            }
++            result.append(data)
++        }
++        return result
++    }
++
++    private static func release(_ object: AnyObject) {
++        heldLock.lock()
++        held.removeAll { $0 === object }
++        heldLock.unlock()
++    }
++
++    private static func waitUntil(timeout: Double, _ condition: () -> Bool) async {
++        let deadline = Date().addingTimeInterval(timeout)
++        while !condition() && Date() < deadline {
++            try? await Task.sleep(nanoseconds: 100_000_000)
++        }
++    }
++}
++
++/// completion / cancellation / interruption はどれが先に来るか分からないので参照型で受ける。
++private final class LCGuestSpawnOutcome: @unchecked Sendable {
++    private let lock = NSLock()
++    private var _completed = false
++    private var _uuid: NSUUID?
++    private var _completionError: NSError?
++    private var _cancelled = false
++    private var _cancellationError: NSError?
++    private var _interrupted = false
++
++    func markCompleted(uuid: NSUUID?, error: NSError?) {
++        lock.lock(); _completed = true; _uuid = uuid; _completionError = error; lock.unlock()
++    }
++    func markCancelled(_ error: NSError?) {
++        lock.lock(); _cancelled = true; _cancellationError = error; lock.unlock()
++    }
++    func markInterrupted() {
++        lock.lock(); _interrupted = true; lock.unlock()
++    }
++
++    var completed: Bool { lock.lock(); defer { lock.unlock() }; return _completed }
++    var uuid: NSUUID? { lock.lock(); defer { lock.unlock() }; return _uuid }
++    var completionError: NSError? { lock.lock(); defer { lock.unlock() }; return _completionError }
++    var cancelled: Bool { lock.lock(); defer { lock.unlock() }; return _cancelled }
++    var cancellationError: NSError? { lock.lock(); defer { lock.unlock() }; return _cancellationError }
++    var interrupted: Bool { lock.lock(); defer { lock.unlock() }; return _interrupted }
++}
++
++// MARK: - 包み替えられた要求 (diag2)
++
++/// TweakLoader の AlarmKitBridge.m が作る payload。
++///
++///     { "v": 1, "bundle": "<Documents/Applications のフォルダ名>",
++///       "container": "<コンテナ UUID>", "origin": "<元の Intent の識別子>",
++///       "archive": "<元の LNAction を NSKeyedArchiver で保存して base64 にしたもの>" }
++struct LCGuestBridgeRequest {
++    static let action = "lc.bridge"
++
++    let bundleFolder: String
++    let container: String
++    let origin: String
++    let archiveBase64: String
++
++    init?(payload: String) {
++        guard let data = payload.data(using: .utf8),
++              let spec = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
++              let bundle = spec["bundle"] as? String, !bundle.isEmpty,
++              let container = spec["container"] as? String, !container.isEmpty,
++              let archive = spec["archive"] as? String, !archive.isEmpty else {
++            return nil
++        }
++        self.bundleFolder = bundle
++        self.container = container
++        self.origin = spec["origin"] as? String ?? "?"
++        self.archiveBase64 = archive
++    }
++
++    /// ゲストのコンテナの `Library/LCBridge/pending.plist` に要求を置き、起こす先を返す。
++    /// 起こされたゲストの中で AlarmKitBridge.m が読んで実行し、消す。
++    func writePending() -> LCGuestTarget? {
++        let documents = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
++            .appendingPathComponent("Documents", isDirectory: true)
++        let appURL = documents.appendingPathComponent("Applications/\(bundleFolder)", isDirectory: true)
++        guard FileManager.default.fileExists(atPath: appURL.path) else {
++            LCGuestTrace.record("  ゲストが見つかりません \(appURL.path)")
++            return nil
++        }
++        let directory = documents
++            .appendingPathComponent("Data/Application/\(container)/Library/LCBridge", isDirectory: true)
++        let pending: NSDictionary = ["date": Date(), "archive": archiveBase64, "origin": origin]
++        do {
++            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
++            try pending.write(to: directory.appendingPathComponent("pending.plist"))
++        } catch {
++            LCGuestTrace.record("  保留中の要求を書けません: \(error)")
++            return nil
++        }
++        LCGuestTrace.record("  保留中の要求を置きました: \(directory.path)/pending.plist")
++        return LCGuestTarget(bundleFolder: bundleFolder, container: container, appURL: appURL)
++    }
++}
++
++// MARK: - ゲストの特定
++
++struct LCGuestTarget {
++    let bundleFolder: String
++    let container: String
++    let appURL: URL
++}
++
++enum LCGuestLocator {
++
++    /// payload の `documents` (= `<LC>/Documents/Data/Application/<UUID>/Documents`)
++    /// からコンテナ UUID を取り出し、それを使っているアプリを探す。
++    static func locate(payload: String) -> LCGuestTarget? {
++        guard let data = payload.data(using: .utf8),
++              let spec = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
++              let documentsPath = spec["documents"] as? String else {
++            LCGuestTrace.record("  ゲスト特定: payload に documents がありません")
++            return nil
++        }
++
++        let components = URL(fileURLWithPath: documentsPath).pathComponents
++        guard let index = components.lastIndex(of: "Application"), index + 1 < components.count else {
++            LCGuestTrace.record("  ゲスト特定: documents の形式が想定外です \(documentsPath)")
++            return nil
++        }
++        let container = components[index + 1]
++
++        let applications = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
++            .appendingPathComponent("Documents/Applications", isDirectory: true)
++        let folders = (try? FileManager.default.contentsOfDirectory(atPath: applications.path)) ?? []
++
++        for folder in folders {
++            let appURL = applications.appendingPathComponent(folder, isDirectory: true)
++            let infoURL = appURL.appendingPathComponent("LCAppInfo.plist")
++            guard let infoData = FileManager.default.contents(atPath: infoURL.path),
++                  let info = (try? PropertyListSerialization.propertyList(from: infoData, format: nil)) as? [String: Any] else {
++                continue
++            }
++            if (info["LCDataUUID"] as? String) == container {
++                return LCGuestTarget(bundleFolder: folder, container: container, appURL: appURL)
++            }
++            if let containers = info["LCContainers"] as? [[String: Any]],
++               containers.contains(where: { ($0["folderName"] as? String) == container }) {
++                return LCGuestTarget(bundleFolder: folder, container: container, appURL: appURL)
++            }
++        }
++        LCGuestTrace.record("  ゲスト特定: コンテナ \(container) を使うアプリが Documents/Applications にありません (共有アプリは未対応)")
++        return nil
++    }
++
++    /// 本家は `NSUserDefaults.lcAppUrlScheme` を渡している。
++    /// LiveContainerShared のカテゴリなので実行時に引き、無ければ Info.plist の先頭を使う。
++    static func hostURLScheme() -> String? {
++        if let value = LCObjC.get(UserDefaults.self as AnyObject, "lcAppUrlScheme") as? String, !value.isEmpty {
++            return value
++        }
++        guard let types = Bundle.main.infoDictionary?["CFBundleURLTypes"] as? [[String: Any]],
++              let schemes = types.first?["CFBundleURLSchemes"] as? [String] else {
++            return nil
++        }
++        return schemes.first
++    }
++}
++
++// MARK: - エラーの記録
++
++enum LCGuestErrorDump {
++
++    /// domain / code / 説明 / userInfo を、下位のエラーまでたどって記録する。
++    static func record(_ error: NSError?, label: String) {
++        guard let error else {
++            LCGuestTrace.record("  \(label): なし")
++            return
++        }
++        LCGuestTrace.record("  \(label):")
++        dump(error, depth: 1, remaining: 6)
++    }
++
++    private static func dump(_ error: NSError, depth: Int, remaining: Int) {
++        let indent = String(repeating: "    ", count: depth)
++        LCGuestTrace.record("\(indent)\(error.domain) code=\(error.code): \(error.localizedDescription)")
++        for (key, value) in error.userInfo.sorted(by: { $0.key < $1.key }) {
++            if key == NSUnderlyingErrorKey || key == NSMultipleUnderlyingErrorsKey { continue }
++            LCGuestTrace.record("\(indent)  \(key) = \(LCObjC.compact(String(describing: value), limit: 400))")
++        }
++        guard remaining > 0 else { return }
++        if let underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError {
++            LCGuestTrace.record("\(indent)  ↳ 下位のエラー:")
++            dump(underlying, depth: depth + 1, remaining: remaining - 1)
++        }
++        if let multiple = error.userInfo[NSMultipleUnderlyingErrorsKey] as? [NSError] {
++            for (i, sub) in multiple.enumerated() {
++                LCGuestTrace.record("\(indent)  ↳ 下位のエラー[\(i)]:")
++                dump(sub, depth: depth + 1, remaining: remaining - 1)
++            }
++        }
++    }
++}
++
++// MARK: - 補助
++
++enum LCObjC {
++
++    /// 引数なしのメソッドを、応答する場合だけ呼ぶ。
++    static func get(_ object: AnyObject, _ selectorName: String) -> AnyObject? {
++        // クラスオブジェクトも NSObjectProtocol として扱える
++        guard let target = object as? NSObjectProtocol else { return nil }
++        let selector = NSSelectorFromString(selectorName)
++        guard target.responds(to: selector) else { return nil }
++        return target.perform(selector)?.takeUnretainedValue()
++    }
++
++    /// 改行を詰めて長さを制限する。
++    static func compact(_ text: String, limit: Int) -> String {
++        let flat = text.split(whereSeparator: \.isNewline)
++            .map { $0.trimmingCharacters(in: .whitespaces) }
++            .joined(separator: " ")
++        return flat.count > limit ? String(flat.prefix(limit)) + "…" : flat
++    }
++}
++
++/// 画面が出ない実行を観測する唯一の手段。
++/// LiveContainer は UIFileSharingEnabled なので「ファイル」アプリから読める。
++enum LCGuestTrace {
++
++    static let fileName = "lc-guest-intent.log"
++    private static let lock = NSLock()
++
++    static func record(_ message: String) {
++        NSLog("[LCGuestIntent] %@", message)
++
++        let documents = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
++            .appendingPathComponent("Documents", isDirectory: true)
++        let url = documents.appendingPathComponent(fileName)
++
++        let formatter = ISO8601DateFormatter()
++        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
++        let line = "[\(formatter.string(from: Date()))] \(message)\n"
++        guard let data = line.data(using: .utf8) else { return }
++
++        lock.lock()
++        defer { lock.unlock() }
++        try? FileManager.default.createDirectory(at: documents, withIntermediateDirectories: true)
++        if let handle = try? FileHandle(forWritingTo: url) {
++            defer { try? handle.close() }
++            _ = try? handle.seekToEnd()
++            try? handle.write(contentsOf: data)
++        } else {
++            try? data.write(to: url)
++        }
++    }
++}
+diff --git a/TweakLoader/AlarmKitBridge.m b/TweakLoader/AlarmKitBridge.m
+new file mode 100644
+index 0000000..a587ed7
+--- /dev/null
++++ b/TweakLoader/AlarmKitBridge.m
+@@ -0,0 +1,338 @@
++//
++//  AlarmKitBridge.m
++//  LiveContainer (TweakLoader)
++//
++//  ゲストアプリを改変せずに、AlarmKit のボタンからゲスト自身の App Intent を動かす。
++//
++//  ── 問題 ────────────────────────────────────────────────────────
++//
++//  AlarmKit は stopIntent / secondaryIntent を「アラームを登録したアプリ」
++//  (= LiveContainer) のメタデータから解決する。ゲストが宣言した Intent は
++//  そこに無いので、ボタンを押しても何も起きない。
++//
++//  ── この版でやること (diag2) ────────────────────────────────────
++//
++//  1. 記録: AlarmKit がゲストのプロセス内で LNAction を保存形式にする瞬間
++//     (+[NSKeyedArchiver archivedDataWithRootObject:requiringSecureCoding:error:])
++//     をフックし、中身と保存形式のデータをファイルに残す。
++//     LCGuestIntent のスタブから作られた本物の LNAction は「型紙」として保存する。
++//
++//  2. 包み替え: ゲスト自身の Intent だったら、元の LNAction を丸ごと保存形式にして
++//     LCGuestIntent (action = "lc.bridge") の LNAction に包んで渡す。
++//     LCGuestIntent は LiveContainer のメタデータにあるので解決される。
++//
++//  3. 実行: LCGuestIntent がゲストを LiveProcess で画面なしで起こすと、
++//     このファイルが起動時に「保留中の要求」を見つけ、元の LNAction を
++//     LNAppContext でゲストのプロセス内で実行する。終わったら自分で終了する。
++//
++//  記録先 (ゲストのコンテナ): Documents/LCBridge/bridge.log
++//  型紙 (LiveContainer の Documents): Documents/LCBridge/template-lcguestintent.archive
++//
++
++#import <Foundation/Foundation.h>
++#import <UIKit/UIKit.h>
++#include <dlfcn.h>
++#include <objc/message.h>
++#include <objc/runtime.h>
++#import "../LiveContainer/utils.h"
++
++static NSString *const LCBGuestIntentID = @"com.kdt.livecontainer.guestIntent";
++static NSString *const LCBBridgeAction = @"lc.bridge";
++/// 型紙が無いときに使う、LiveContainer 側の型名 (一致は必須ではないことを実測済み)
++static NSString *const LCBFallbackMangledName = @"13LiveContainer13LCGuestIntentV";
++
++#pragma mark - 記録
++
++static NSURL *LCBGuestDir(void) {
++    NSURL *dir = [[NSURL fileURLWithPath:NSHomeDirectory()] URLByAppendingPathComponent:@"Documents/LCBridge" isDirectory:YES];
++    [NSFileManager.defaultManager createDirectoryAtURL:dir withIntermediateDirectories:YES attributes:nil error:nil];
++    return dir;
++}
++
++/// LiveContainer 自身の Documents/LCBridge。LiveProcess からは書けないことがあるので nil を返しうる。
++static NSURL *LCBHostDir(void) {
++    const char *home = getenv("LC_HOME_PATH");
++    if (!home) return nil;
++    NSURL *dir = [[NSURL fileURLWithPath:@(home)] URLByAppendingPathComponent:@"Documents/LCBridge" isDirectory:YES];
++    if (![NSFileManager.defaultManager createDirectoryAtURL:dir withIntermediateDirectories:YES attributes:nil error:nil]) return nil;
++    return dir;
++}
++
++static void LCBLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
++static void LCBLog(NSString *format, ...) {
++    va_list args;
++    va_start(args, format);
++    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
++    va_end(args);
++    NSLog(@"[LCBridge] %@", message);
++
++    static NSISO8601DateFormatter *formatter;
++    static dispatch_once_t once;
++    dispatch_once(&once, ^{
++        formatter = [NSISO8601DateFormatter new];
++        formatter.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
++    });
++    NSString *line = [NSString stringWithFormat:@"[%@] pid=%d%@ %@\n",
++                      [formatter stringFromDate:NSDate.date], getpid(),
++                      getenv("LP_HOME_PATH") ? @" (LiveProcess)" : @"", message];
++    NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
++
++    @synchronized (NSFileManager.class) {
++        NSURL *url = [LCBGuestDir() URLByAppendingPathComponent:@"bridge.log"];
++        NSFileHandle *handle = [NSFileHandle fileHandleForWritingToURL:url error:nil];
++        if (handle) {
++            [handle seekToEndOfFile];
++            [handle writeData:data];
++            [handle closeFile];
++        } else {
++            [data writeToURL:url atomically:YES];
++        }
++    }
++}
++
++/// LNAction の中身を 1 行ずつ書き出す。
++static void LCBDescribeAction(id action, NSString *label) {
++    LCBLog(@"  %@: identifier=%@ mangledTypeName=%@ openAppWhenRun=%@",
++           label, [action valueForKey:@"identifier"], [action valueForKey:@"mangledTypeName"],
++           [action valueForKey:@"openAppWhenRun"]);
++    NSArray *parameters = [action valueForKey:@"parameters"];
++    for (id property in parameters) {
++        id value = nil;
++        @try { value = [property valueForKey:@"value"]; } @catch (NSException *e) {}
++        LCBLog(@"    param id=%@ class=%@ value=%@", [property valueForKey:@"identifier"],
++               NSStringFromClass([property class]), value);
++    }
++}
++
++#pragma mark - 包み替え
++
++static id LCBMakeValue(NSString *string) {
++    Class valueClass = NSClassFromString(@"LNValue");
++    Class typeClass = NSClassFromString(@"LNPrimitiveValueType");
++    id type = ((id (*)(id, SEL))objc_msgSend)(typeClass, NSSelectorFromString(@"stringValueType"));
++    id value = [valueClass alloc];
++    return ((id (*)(id, SEL, id, id))objc_msgSend)(value, NSSelectorFromString(@"initWithValue:valueType:"), string, type);
++}
++
++static id LCBMakeProperty(NSString *identifier, NSString *string) {
++    id property = [NSClassFromString(@"LNProperty") alloc];
++    return ((id (*)(id, SEL, id, id))objc_msgSend)(property, NSSelectorFromString(@"initWithIdentifier:value:"),
++                                                   identifier, LCBMakeValue(string));
++}
++
++static id LCBUnarchive(NSData *data) {
++    NSError *error = nil;
++    NSKeyedUnarchiver *unarchiver = [[NSKeyedUnarchiver alloc] initForReadingFromData:data error:&error];
++    if (!unarchiver) {
++        LCBLog(@"  復元できません: %@", error);
++        return nil;
++    }
++    unarchiver.requiresSecureCoding = NO;
++    id object = [unarchiver decodeObjectForKey:NSKeyedArchiveRootObjectKey];
++    [unarchiver finishDecoding];
++    return object;
++}
++
++/// 元の LNAction を LCGuestIntent の LNAction に包む。
++///
++/// 型紙 (スタブから作られた本物) があれば、引数の識別子と型名をそれに合わせる。
++/// 無ければ Swift のプロパティ名 (handler / action / payload) を使う。
++static id LCBWrap(id original, NSData *archive) {
++    NSString *container = NSHomeDirectory().lastPathComponent;
++    NSString *bundleFolder = NSBundle.mainBundle.bundlePath.lastPathComponent;
++    NSDictionary *payload = @{
++        @"v": @1,
++        @"bundle": bundleFolder,
++        @"container": container,
++        @"origin": [original valueForKey:@"identifier"] ?: @"?",
++        @"archive": [archive base64EncodedStringWithOptions:0],
++    };
++    NSData *json = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
++    NSString *payloadText = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
++    NSDictionary<NSString *, NSString *> *values = @{ @"handler": @"", @"action": LCBBridgeAction, @"payload": payloadText };
++
++    NSArray<NSString *> *identifiers = @[ @"handler", @"action", @"payload" ];
++    NSString *mangledName = LCBFallbackMangledName;
++    NSString *source = @"推測 (型紙なし)";
++
++    NSURL *hostDir = LCBHostDir();
++    NSURL *templateURL = hostDir ? [hostDir URLByAppendingPathComponent:@"template-lcguestintent.archive"] : nil;
++    NSData *templateData = templateURL ? [NSData dataWithContentsOfURL:templateURL] : nil;
++    if (!templateData) LCBLog(@"  型紙がありません (%@)", templateURL.path ?: @"LC_HOME_PATH なし");
++    id template = templateData ? LCBUnarchive(templateData) : nil;
++    if (template) {
++        NSArray *templateParameters = [template valueForKey:@"parameters"];
++        if (templateParameters.count == 3) {
++            identifiers = [templateParameters valueForKey:@"identifier"];
++            mangledName = [template valueForKey:@"mangledTypeName"] ?: mangledName;
++            source = @"型紙";
++        } else {
++            LCBLog(@"  型紙の引数が %lu 個なので使いません", (unsigned long)templateParameters.count);
++        }
++    }
++
++    // 識別子が handler / action / payload ならその名前で、違えば宣言順で値を割り当てる。
++    NSArray<NSString *> *order = @[ @"handler", @"action", @"payload" ];
++    NSMutableArray *properties = [NSMutableArray array];
++    for (NSUInteger i = 0; i < identifiers.count; i++) {
++        NSString *identifier = identifiers[i];
++        NSString *value = values[identifier] ?: values[order[i]];
++        [properties addObject:LCBMakeProperty(identifier, value)];
++    }
++
++    id action = [NSClassFromString(@"LNAction") alloc];
++    action = ((id (*)(id, SEL, id, id, BOOL, id))objc_msgSend)(
++        action, NSSelectorFromString(@"initWithIdentifier:mangledTypeName:openAppWhenRun:parameters:"),
++        LCBGuestIntentID, mangledName, NO, properties);
++    LCBLog(@"  包み替え: 引数の識別子=%@ 型名=%@ (%@) payload=%lu 文字",
++           [identifiers componentsJoinedByString:@","], mangledName, source, (unsigned long)payloadText.length);
++    return action;
++}
++
++#pragma mark - フック
++
++static NSData *(*LCBOriginalArchive)(id, SEL, id, BOOL, NSError **);
++
++static NSData *LCBHookArchive(id self, SEL _cmd, id root, BOOL secure, NSError **error) {
++    Class actionClass = NSClassFromString(@"LNAction");
++    if (!actionClass || ![root isKindOfClass:actionClass]) {
++        return LCBOriginalArchive(self, _cmd, root, secure, error);
++    }
++
++    // 呼び出し元が AlarmKit のときだけ扱う。
++    Dl_info info = {0};
++    void *returnAddress = __builtin_return_address(0);
++    NSString *caller = (dladdr(returnAddress, &info) && info.dli_fname) ? @(info.dli_fname).lastPathComponent : @"?";
++    if (![caller isEqualToString:@"AlarmKit"]) {
++        return LCBOriginalArchive(self, _cmd, root, secure, error);
++    }
++
++    NSData *original = LCBOriginalArchive(self, _cmd, root, secure, error);
++    NSString *identifier = [root valueForKey:@"identifier"];
++    LCBLog(@"AlarmKit が LNAction を保存形式にします (%lu バイト)", (unsigned long)original.length);
++    LCBDescribeAction(root, @"元");
++
++    NSString *stamp = [NSString stringWithFormat:@"%.0f", NSDate.date.timeIntervalSince1970 * 1000];
++    [original writeToURL:[LCBGuestDir() URLByAppendingPathComponent:
++                          [NSString stringWithFormat:@"%@-%@.archive", stamp, identifier]] atomically:YES];
++
++    if ([identifier isEqualToString:LCBGuestIntentID]) {
++        // スタブから作られた本物。型紙として保存し、そのまま渡す。
++        NSURL *hostDir = LCBHostDir();
++        if (hostDir && [original writeToURL:[hostDir URLByAppendingPathComponent:@"template-lcguestintent.archive"] atomically:YES]) {
++            LCBLog(@"  LCGuestIntent のスタブ。型紙として保存しました");
++        }
++        return original;
++    }
++
++    id wrapped = LCBWrap(root, original);
++    if (!wrapped) {
++        LCBLog(@"  包み替えに失敗。元のまま渡します");
++        return original;
++    }
++    LCBDescribeAction(wrapped, @"包み替え後");
++    return LCBOriginalArchive(self, _cmd, wrapped, secure, error);
++}
++
++#pragma mark - 実行 (LiveProcess で起こされたとき)
++
++static NSURL *LCBPendingURL(void) {
++    return [[NSURL fileURLWithPath:NSHomeDirectory()] URLByAppendingPathComponent:@"Library/LCBridge/pending.plist"];
++}
++
++static void LCBExitIfHeadless(NSString *reason) {
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
++        if (UIApplication.sharedApplication.connectedScenes.count > 0) {
++            LCBLog(@"画面が接続されているので終了しません");
++            return;
++        }
++        LCBLog(@"画面なしで起こされたので終了します (%@)", reason);
++        exit(0);
++    });
++}
++
++static void LCBRunPending(void) {
++    NSURL *url = LCBPendingURL();
++    NSDictionary *pending = [NSDictionary dictionaryWithContentsOfURL:url];
++    [NSFileManager.defaultManager removeItemAtURL:url error:nil];
++    if (!pending) return;
++
++    NSDate *date = pending[@"date"];
++    if (![date isKindOfClass:NSDate.class] || -date.timeIntervalSinceNow > 120) {
++        LCBLog(@"保留中の要求が古いので実行しません (%@)", date);
++        return;
++    }
++
++    NSData *archive = [[NSData alloc] initWithBase64EncodedString:pending[@"archive"] ?: @"" options:0];
++    id action = archive ? LCBUnarchive(archive) : nil;
++    if (!action) {
++        LCBLog(@"保留中の要求を復元できません");
++        LCBExitIfHeadless(@"復元失敗");
++        return;
++    }
++    LCBLog(@"保留中の要求を実行します");
++    LCBDescribeAction(action, @"実行");
++
++    Class contextClass = NSClassFromString(@"LNAppContext");
++    Class optionsClass = NSClassFromString(@"LNActionExecutorOptions");
++    if (!contextClass || !optionsClass) {
++        LCBLog(@"LNAppContext / LNActionExecutorOptions がありません");
++        LCBExitIfHeadless(@"クラスなし");
++        return;
++    }
++
++    // 本家 SideStoreSupport/PrivateIntentRunner.m と同じ設定。
++    id options = [optionsClass new];
++    @try {
++        [options setValue:@"LCBridge" forKey:@"clientLabel"];
++        [options setValue:@2 forKey:@"kind"];
++        [options setValue:@NO forKey:@"donateToTranscript"];
++    } @catch (NSException *e) {
++        LCBLog(@"オプションの設定に失敗: %@", e);
++    }
++
++    id context = [contextClass new];
++    NSProgress *progress = [NSProgress progressWithTotalUnitCount:1];
++    audit_token_t token = {0};
++    NSDate *startedAt = NSDate.date;
++
++    // auditToken は 32 バイトの struct。arm64 では参照渡しになるのでポインタで渡す (本家と同じ)。
++    typedef void (*PerformFunction)(id, SEL, id, id, id, id, audit_token_t *, void (^)(id, NSError *));
++    ((PerformFunction)objc_msgSend)(
++        context, NSSelectorFromString(@"performAction:options:reportingProgress:delegate:auditToken:completionHandler:"),
++        action, options, progress, nil, &token, ^(id result, NSError *error) {
++            LCBLog(@"実行完了 (%.0f ms) result=%@ error=%@",
++                   -startedAt.timeIntervalSinceNow * 1000, result, error);
++            if (error.userInfo[NSUnderlyingErrorKey]) {
++                LCBLog(@"  下位のエラー: %@", error.userInfo[NSUnderlyingErrorKey]);
++            }
++            LCBExitIfHeadless(@"実行完了");
++        });
++
++    // 完了が来ない場合の保険
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
++        LCBExitIfHeadless(@"25 秒で完了しない");
++    });
++}
++
++#pragma mark - 入口
++
++__attribute__((constructor))
++static void LCBridgeInit(void) {
++    if (!NSUserDefaults.lcGuestAppId) return;
++
++    Method method = class_getClassMethod(NSKeyedArchiver.class, @selector(archivedDataWithRootObject:requiringSecureCoding:error:));
++    if (method) {
++        LCBOriginalArchive = (NSData *(*)(id, SEL, id, BOOL, NSError **))method_setImplementation(method, (IMP)LCBHookArchive);
++    }
++
++    if (getenv("LP_HOME_PATH") && [NSFileManager.defaultManager fileExistsAtPath:LCBPendingURL().path]) {
++        LCBLog(@"保留中の要求があります。起動完了を待って実行します");
++        [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidFinishLaunchingNotification
++                                                        object:nil
++                                                         queue:NSOperationQueue.mainQueue
++                                                    usingBlock:^(NSNotification *note) {
++            LCBRunPending();
++        }];
++    }
++}
+diff --git a/docs/AlarmKitBridge-diag2.md b/docs/AlarmKitBridge-diag2.md
+new file mode 100644
+index 0000000..ea3a707
+--- /dev/null
++++ b/docs/AlarmKitBridge-diag2.md
+@@ -0,0 +1,93 @@
++# AlarmKitBridge 検証版 (diag2)
++
++diag1 (LCGuestIntent + LiveProcess 起動) に、**ゲストを改変せずに** AlarmKit のボタンから
++ゲスト自身の App Intent を動かす「透過ブリッジ」を足したもの。
++
++## 目的と完了条件
++
++- 目的: スタブを持たない普通のアプリ (BridgeProbe) の stopIntent / secondaryIntent が、
++  素の LiveContainer 上で実行されること。
++- 完了条件 (どれか 1 つでも「はい」なら前進):
++  1. AlarmKit の停止ボタンで BridgeProbe の `ProbeStopIntent.perform()` が走り、`bridge-probe.log` に ★ 行が出る
++  2. 走らない場合、どの段で止まったかがログで 1 つに特定できる
++
++## 仕組み
++
++```
++[登録時: ゲストのプロセス (LC 本体)]
++  AlarmManager.schedule(stopIntent: ProbeStopIntent(...))
++    └ AlarmKit が LNAction を NSKeyedArchiver で保存形式にする ← ここをフック (TweakLoader/AlarmKitBridge.m)
++         ・元の LNAction を丸ごと保存形式にし、base64 で payload に入れる
++         ・LCGuestIntent (action="lc.bridge") の LNAction に差し替えて AlarmKit に返す
++
++[停止ボタン: LiveContainer のメタデータで解決される]
++  LCGuestIntent.perform()  (LiveContainer/LCGuestIntent.swift)
++    └ payload から pending.plist をゲストのコンテナ Library/LCBridge/ に書く
++    └ LiveProcess.appex でゲストを画面なしで起こす (diag1 で実証済み)
++
++[ゲストのプロセス (LiveProcess)]
++  AlarmKitBridge.m の constructor が pending.plist を見つける
++    └ 起動完了後に元の LNAction を復元し、LNAppContext.performAction でプロセス内実行
++    └ 終わったら (画面が無ければ) exit
++```
++
++LCGuestIntent のスタブを持つアプリ (AlarmClock v51) は包み替えない。
++代わりに、AlarmKit が作った本物の LNAction を **型紙** として
++`LiveContainer の Documents/LCBridge/template-lcguestintent.archive` に保存する。
++包み替えでは型紙の引数識別子と型名を使う (手作りより確実)。
++
++## 変更点 (diag1 からの差分)
++
++| ファイル | 内容 |
++|---|---|
++| `TweakLoader/AlarmKitBridge.m` | 新規。フック・型紙保存・包み替え・保留要求の実行 |
++| `LiveContainer/LCGuestIntent.swift` | action `lc.bridge` を受けたら payload から保留要求を書き、そのゲストを起こす (`LCGuestBridgeRequest`) |
++| `LiveContainer.xcodeproj/project.pbxproj` | TweakLoader の `membershipExceptions` に `AlarmKitBridge.m` を追加 (同期フォルダでも自動では入らない) |
++| `.github/workflows/build-guest-intent.yml` | TweakLoader.dylib に AlarmKitBridge が入ったかを検査。成果物名を `-diag2` に |
++
++Info.plist と entitlements は変えていない。**上書きインストールで検証できる。**
++
++## 手順
++
++1. このフォルダを push → Actions **Build IPA (LCGuestIntent diag2)** → `LiveContainer-guestintent-diag2.ipa`
++2. SideStore で上書きインストール (拡張は残す)
++3. **型紙を作る**: LC 内の AlarmClock v51 でアラームを 1 件登録し直す (保存するだけでよい。鳴らさなくてよい)
++   → `ファイル > LiveContainer > LCBridge > template-lcguestintent.archive` ができる
++4. `BridgeProbe-v1.0.0.zip` をビルドした ipa を **LC に** 入れる
++   (比較のため、可能なら SideStore で直インストールも 1 回やる。直インストールでは包み替えは起きない)
++5. BridgeProbe で次を試す
++
++| # | 操作 | 期待 (成功時) |
++|---|---|---|
++| 1 | 「.countdown で登録」→ 60 秒待つ → **ロック中に停止** | `★ ProbeStopIntent が実行されました note=停止テスト #n count=n 環境=LiveContainer (LiveProcess)` |
++| 2 | 「.countdown で登録」→ 鳴ったら **スヌーズ** | `★ ProbeSnoozeIntent … custom=false` が出るか (= `.countdown` でも secondaryIntent が走るか) |
++| 3 | 「.custom で登録」→ 鳴ったら **スヌーズ** | `★ ProbeSnoozeIntent … custom=true` → `★ stop(id:) 成功` で鳴り止む |
++
++`.custom` は Intent が走らないとスヌーズで止まらない。止まらなければ停止ボタンで止める。
++
++## 集めるログ
++
++| ファイル | 場所 (ファイル App) | 中身 |
++|---|---|---|
++| `bridge-probe.log` | BridgeProbe の Documents (アプリ内「プローブ」タブから共有可) | Intent が走ったか |
++| `bridge.log` | BridgeProbe の Documents/LCBridge (アプリ内「LCBridge」タブ) | 包み替え・保留要求の実行・LNAppContext の結果 |
++| `lc-guest-intent.log` | LiveContainer の Documents | LCGuestIntent が受けたか・LiveProcess 起動 |
++| `*.archive` | BridgeProbe の Documents/LCBridge と LC の Documents/LCBridge | LNAction の実物 (こちらで plist を解析する) |
++
++## ログの読み方 (段ごと)
++
++| 段 | 見る行 | 止まったときの意味 |
++|---|---|---|
++| A. フック | `bridge.log`: `AlarmKit が LNAction を保存形式にします` | 出ない → 呼び出し元判定 (AlarmKit) が外れた / 別 API で保存している |
++| B. 包み替え | `包み替え: 引数の識別子=… (型紙)` | `推測 (型紙なし)` → 手順 3 をやり直す |
++| C. 解決 | `lc-guest-intent.log`: `包み替えられた Intent: …ProbeStopIntent` | 出ない → AlarmKit が包み替えた LNAction を解決できなかった (型名・引数の不一致) |
++| D. 起動 | `[結果] LiveProcess 起動成功` | diag1 と同じ切り分け |
++| E. 実行 | `bridge.log`: `保留中の要求を実行します` → `実行完了 … error=` | error の domain/code が次の手掛かり |
++| F. 結果 | `bridge-probe.log`: ★ 行 | E が成功で F が無い → LNAppContext は成功扱いだが perform に届いていない |
++
++## 既知の制限
++
++- 共有アプリ (App Group 側に置いたアプリ) と、コンテナをブックマークで外に置いたアプリは保留要求の場所を特定できない。
++- 保留要求は 120 秒で無効。
++- `LNAppContext` は非公開 API。iOS の更新で引数が変わると E で落ちる (ログに出る)。
++- +SideStore 版では使えない (diag1 と同じ理由)。
+diff --git a/docs/LCGuestIntent.md b/docs/LCGuestIntent.md
+new file mode 100644
+index 0000000..f02afcf
+--- /dev/null
++++ b/docs/LCGuestIntent.md
+@@ -0,0 +1,107 @@
++# LCGuestIntent 検証版 (diag1)
++
++> diag2 (ゲストを改変しない透過ブリッジ) は [AlarmKitBridge-diag2.md](AlarmKitBridge-diag2.md) を参照。
++> diag1 は 2026-11-03 に実機で成功を確認済み (ロック中・背面から LiveProcess 起動 214 ms)。
++
++本家 main `9108ae62` (2026-10-17, 3.3.55) に、ゲスト用の汎用 Intent と
++LiveProcess 起動の診断を追加したもの。
++
++## 何を確かめるか
++
++これまで「背面のアプリからは LiveProcess.appex を起動できない（条件は前面）」と
++結論していたが、根拠は **completion が nil UUID で返り、理由が分からない** ことだけだった。
++
++iPadOS 26.6.1 の ExtensionFoundation を逆アセンブルすると、
++`-[EXConcreteExtension _beginExtensionRequest:completion:]` は失敗時に
++**`completion(nil, error)` と 2 引数で呼んでいる**。本家の `FoundationPrivate.h` も
++これまでの検証コードも completion を 1 引数で宣言していたので、エラーを捨てていた。
++
++この版はエラーを受け取り、次の条件と一緒に記録する。
++
++| 記録するもの | 切り分けたい仮説 |
++|---|---|
++| 呼び出し元 (`LiveActivityIntent` / 通常の `AppIntent`) | Intent の種類で RunningBoard の権利が違う (LinkServices は LiveActivityIntent だけ専用アサーションを使う) |
++| ロック状態 (`isProtectedDataAvailable`) | ロック中だけ起動できない |
++| `applicationState` / RunningBoard の状態 | 前面・背面そのものが条件 |
++| エラーの domain / code / 下位エラー | 上のどれでもない原因 |
++
++## 変更点
++
++| ファイル | 内容 |
++|---|---|
++| `LiveContainer/LCGuestIntent.swift` | 新規。`LCGuestIntent` (LiveActivityIntent) と `LCGuestProbeIntent` (通常の AppIntent、ショートカット用) |
++| `LiveContainer.xcodeproj/project.pbxproj` | 上のファイルをアプリターゲットの Sources に追加 (4 行) |
++| `.github/workflows/build-guest-intent.yml` | 新規。submodule を固定 SHA で取り直してビルドし、メタデータに Intent が入ったかを検査する |
++
++`Info.plist` と entitlements は変えていない。**上書きインストールで検証できる**（端末の再起動も不要）。
++
++本家の `build.yml` / `update_source.yml` は残してある。ZIP から作ったリポジトリでは
++submodule が空なので `build.yml` は毎回失敗する。邪魔なら GitHub の web UI から削除してよい。
++
++## 動き
++
++```
++停止ボタン (AlarmKit) ─→ LCGuestIntent.perform()          ┐
++ショートカット       ─→ LCGuestProbeIntent.perform()      ┘ 同じ処理
++  1. 環境を記録
++  2. payload の documents からゲストを特定
++  3. LiveProcess.appex でゲストを画面なしで起動
++       成功 → ゲスト (AlarmClock の HeadlessRunner) が音源を差し替えて exit
++       失敗 → エラーをすべて記録し、Tweaks の dylib をこのプロセスで呼ぶ (従来どおり)
++```
++
++失敗しても従来の経路に戻るので、アラームの曲の差し替えは止まらない。
++成功した場合は二重に差し替えないよう、プロセス内のハンドラは呼ばない。
++
++## 手順
++
++1. このフォルダをリポジトリに push → Actions の **Build IPA (LCGuestIntent)** が走る
++2. `LiveContainer-guestintent.ipa` を SideStore でインストール
++   （拡張は残す: "Keep App Extensions (Use Main Profile)"。LiveProcess.appex が要る）
++3. AlarmClock v51 はそのまま（スヌーズ方式はオフのまま）
++4. 次の 4 通りを試す。1 回ごとに `ファイル > このデバイス内 > LiveContainer > lc-guest-intent.log` を保存
++
++| # | 起点 | 端末の状態 |
++|---|---|---|
++| A | アラームを鳴らし、ロック画面で停止 | ロック中 |
++| B | 使用中にアラームを鳴らし、バナーで停止 | ロック解除中 |
++| C | ショートカットアプリで「Guest Probe (LiveContainer)」を実行 | ロック解除中 |
++| D | 時刻オートメーション（すぐに実行）で同じアクション | ロック中 |
++
++C と D は直前に停止ボタンで受け取った要求を再生するので、**A か B を先に 1 回やっておく**。
++C はショートカットの結果に要約が表示される。
++
++## ログの読み方
++
++```
++──── 呼び出し元: LiveActivityIntent (AlarmKit など)
++  handler=AlarmClockGuestPerform action=reshuffle
++  pid=… applicationState=background ロック=ロック中 (保護データ利用不可)
++  RBS状態: <RBSProcessState| … assertions … >
++  ゲスト: com.example.alarmclock.app コンテナ: 0E44E47E-…
++  起動要求: com.kdt.livecontainer.XXXX.LiveProcess scheme=livecontainer bookmarks=4
++  completion: UUID=nil (72 ms)
++  completion のエラー:
++    <domain> code=<n>: <説明>
++      <userInfo>
++      ↳ 下位のエラー:
++        <domain> code=<n>: …
++  [結果] LiveProcess 起動失敗: UUID=nil [<domain> code=<n>]
++  プロセス内ハンドラ: AlarmClockGuestPerform result=0
++```
++
++**`completion のエラー` の数行が今回の目的**です。4 通りのログをそのまま見せてください。
++
++成功した場合はこうなる。
++
++```
++  completion: 起動しました pid=1234 (180 ms)
++  [結果] LiveProcess 起動成功 pid=1234 (6.4 秒後に終了)。処理はゲスト側に任せる
++```
++
++## 既知の制限
++
++- **+SideStore 版では使えない。** `build_github.sh` が SideStore の `Metadata.appintents` で
++  上書きするので、この Intent が消える。このワークフローは素の版だけを作る。
++- 共有アプリ（App Group 側に置いたアプリ）はゲストを特定できない。その場合は起動を省略し、従来の経路で処理する。
++- `LiveActivityIntent` の実行時間には上限がある。待機は合計で最大約 25 秒にしている。

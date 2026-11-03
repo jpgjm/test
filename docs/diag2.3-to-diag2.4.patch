@@ -1,0 +1,275 @@
+diff -ruN a/.github/workflows/build-guest-intent.yml b/.github/workflows/build-guest-intent.yml
+--- a/.github/workflows/build-guest-intent.yml	2026-11-03 06:25:18.195403321 +0000
++++ b/.github/workflows/build-guest-intent.yml	2026-11-03 06:38:15.994813322 +0000
+@@ -7,7 +7,7 @@
+ # +SideStore 版は作らない。build_github.sh が SideStore の
+ # Metadata.appintents で上書きするため、LCGuestIntent が消える。
+ 
+-name: Build IPA (LCGuestIntent diag2.3)
++name: Build IPA (LCGuestIntent diag2.4)
+ 
+ on:
+   push:
+@@ -92,7 +92,7 @@
+             exit 1
+           fi
+           # diag2.1: 型紙を複製する版 / diag2.2: 実行時のメタデータ対策が入ったか
+-          for marker in "actionWithParameters:" "isAppMetadataViaXPCEnabled" "initWithBundle:usingEffectiveBundleIdentifier:error:" "initWithMetadata:mangledTypeName:parameters:"; do
++          for marker in "actionWithParameters:" "isAppMetadataViaXPCEnabled" "initWithBundle:usingEffectiveBundleIdentifier:error:" "initWithMetadata:mangledTypeName:parameters:" "initWithMetadata:bundleIdentifier:parameters:"; do
+             if strings "$app/Frameworks/TweakLoader.dylib" | grep -q "$marker"; then
+               echo "OK: AlarmKitBridge ($marker)"
+             else
+@@ -111,5 +111,5 @@
+       - name: Upload IPA
+         uses: actions/upload-artifact@v4
+         with:
+-          name: LiveContainer-guestintent-diag2.3.ipa
++          name: LiveContainer-guestintent-diag2.4.ipa
+           path: LiveContainer.ipa
+diff -ruN a/TweakLoader/AlarmKitBridge.m b/TweakLoader/AlarmKitBridge.m
+--- a/TweakLoader/AlarmKitBridge.m	2026-11-03 06:25:18.204207729 +0000
++++ b/TweakLoader/AlarmKitBridge.m	2026-11-03 06:33:25.389761347 +0000
+@@ -30,6 +30,8 @@
+ //  diag2.2: LiveProcess で実行するとき intentNotFound になる問題への対策
+ //     (ゲストのメタデータの付け直しと、AppManager への静的メタデータの強制)。
+ //  diag2.3: 付け直しの作り方を 3 通りに (diag2.2 では存在確認で弾かれて試されなかった)。
++//  diag2.4: 型紙を不要にした。包み替え先の LCGuestIntent は LiveContainer 自身の
++//     Metadata.appintents から組み立てる (型紙はあれば予備)。
+ //
+ //  記録先 (ゲストのコンテナ): Documents/LCBridge/bridge.log
+ //  型紙 (LiveContainer の Documents): Documents/LCBridge/template-lcguestintent.archive
+@@ -38,6 +40,7 @@
+ #import <Foundation/Foundation.h>
+ #import <UIKit/UIKit.h>
+ #include <dlfcn.h>
++#include <mach-o/dyld.h>
+ #include <objc/message.h>
+ #include <objc/runtime.h>
+ #import "../LiveContainer/utils.h"
+@@ -179,6 +182,8 @@
+ /// metadata (LNActionMetadata) と systemProtocols (SessionStarting) が空になっていた。
+ ///
+ /// 型紙が無い・使えないときは diag2 と同じ手作りに戻る (metadata なし)。
++static id LCBMakeGuestIntentFromHostMetadata(NSArray *properties);
++
+ static id LCBWrap(id original, NSData *archive) {
+     NSString *container = NSHomeDirectory().lastPathComponent;
+     NSString *bundleFolder = NSBundle.mainBundle.bundlePath.lastPathComponent;
+@@ -197,6 +202,20 @@
+     NSArray *valueTypes = nil;
+     NSString *mangledName = LCBFallbackMangledName;
+ 
++    // diag2.4: まず LiveContainer 自身のメタデータから組み立てる (型紙は不要)
++    {
++        NSMutableArray *hostProperties = [NSMutableArray array];
++        for (NSString *identifier in identifiers) {
++            [hostProperties addObject:LCBMakeProperty(identifier, values[identifier], nil)];
++        }
++        id hostAction = LCBMakeGuestIntentFromHostMetadata(hostProperties);
++        if (hostAction) {
++            LCBLog(@"  包み替え: LiveContainer のメタデータから組み立て payload=%lu 文字", (unsigned long)payloadText.length);
++            return hostAction;
++        }
++        LCBLog(@"  LiveContainer のメタデータから組み立てられません。型紙を探します");
++    }
++
+     NSURL *hostDir = LCBHostDir();
+     NSURL *templateURL = hostDir ? [hostDir URLByAppendingPathComponent:@"template-lcguestintent.archive"] : nil;
+     NSData *templateData = templateURL ? [NSData dataWithContentsOfURL:templateURL] : nil;
+@@ -410,13 +429,12 @@
+     }
+ }
+ 
+-/// A. ゲスト自身の Metadata.appintents から、identifier の LNActionMetadata を読む。
+-static id LCBLoadGuestActionMetadata(NSString *identifier) {
++/// バンドルの Metadata.appintents から、identifier の LNActionMetadata を読む。
++/// ゲスト (A の付け直し) と LiveContainer 自身 (diag2.4 の包み替え) の両方で使う。
++static id LCBLoadActionMetadata(NSURL *bundleURL, NSString *bundleID, NSString *identifier) {
+     NSBundle *main = NSBundle.mainBundle;
+-    NSURL *bundleURL = main.bundleURL;
+-    NSString *bundleID = main.bundleIdentifier;
+     if (!bundleURL || !bundleID) {
+-        LCBLog(@"  メタデータ: mainBundle の URL / ID がありません");
++        LCBLog(@"  メタデータ: バンドルの URL / ID がありません");
+         return nil;
+     }
+ 
+@@ -441,7 +459,7 @@
+     if ([NSBundle instancesRespondToSelector:uniqueInit]) {
+         bundle = ((id (*)(id, SEL, id))objc_msgSend)([NSBundle alloc], uniqueInit, bundleURL);
+     }
+-    if (!bundle) bundle = main;
++    if (!bundle) bundle = [NSBundle bundleWithURL:bundleURL] ?: main;
+ 
+     NSError *error = nil;
+     id metadata = nil;
+@@ -472,6 +490,51 @@
+     return actionMetadata;
+ }
+ 
++/// A. ゲスト自身の Metadata.appintents から読む。
++static id LCBLoadGuestActionMetadata(NSString *identifier) {
++    NSBundle *main = NSBundle.mainBundle;
++    return LCBLoadActionMetadata(main.bundleURL, main.bundleIdentifier, identifier);
++}
++
++#pragma mark - diag2.4: 型紙なしで LCGuestIntent を組み立てる
++//
++// これまでは AlarmClock (LCGuestIntent のスタブを持つアプリ) でアラームを保存して
++// 「型紙」を作り、包み替えはその複製で作っていた。diag2.4 では LiveContainer 自身の
++// Metadata.appintents から LCGuestIntent の LNActionMetadata を読み、それから組み立てる。
++// 型紙は不要になる (あれば予備として使う)。
++
++/// LiveContainer.app の場所。ゲストの中では mainBundle がゲストに差し替わっているので、
++/// プロセスの実行ファイル (dyld のイメージ 0) から辿る。LiveProcess では
++/// LiveContainer.app/PlugIns/LiveProcess.appex/LiveProcess なので 2 つ上がる。
++static NSURL *LCBHostAppBundleURL(void) {
++    const char *image = _dyld_get_image_name(0);
++    if (!image) return nil;
++    NSURL *url = [[NSURL fileURLWithPath:@(image)] URLByDeletingLastPathComponent];
++    if ([url.pathExtension isEqualToString:@"appex"]) {
++        url = [[url URLByDeletingLastPathComponent] URLByDeletingLastPathComponent];
++    }
++    return [url.pathExtension isEqualToString:@"app"] ? url : nil;
++}
++
++/// LiveContainer の LCGuestIntent の LNActionMetadata (プロセス内で 1 回だけ読む)。
++static id LCBHostGuestIntentMetadata(NSString **bundleIDOut) {
++    static id cached;
++    static NSString *cachedBundleID;
++    static dispatch_once_t once;
++    dispatch_once(&once, ^{
++        NSURL *hostURL = LCBHostAppBundleURL();
++        NSDictionary *info = hostURL ? [NSDictionary dictionaryWithContentsOfURL:[hostURL URLByAppendingPathComponent:@"Info.plist"]] : nil;
++        NSString *bundleID = info[@"CFBundleIdentifier"];
++        LCBLog(@"  LiveContainer 本体: %@ (id=%@)", hostURL.path ?: @"見つかりません", bundleID);
++        if (hostURL && bundleID) {
++            cached = LCBLoadActionMetadata(hostURL, bundleID, LCBGuestIntentID);
++            cachedBundleID = bundleID;
++        }
++    });
++    if (bundleIDOut) *bundleIDOut = cachedBundleID;
++    return cached;
++}
++
+ /// LNAction の init 系メソッドを列挙して記録する (diag2.3 の診断)。
+ static void LCBDescribeActionInitializers(Class actionClass) {
+     unsigned int count = 0;
+@@ -568,6 +631,60 @@
+     }
+     return nil;
+ }
++
++/// LiveContainer のメタデータから LCGuestIntent の LNAction を組み立てる (diag2.4)。
++/// properties は handler / action / payload の LNProperty。
++static id LCBMakeGuestIntentFromHostMetadata(NSArray *properties) {
++    NSString *bundleID = nil;
++    id metadata = LCBHostGuestIntentMetadata(&bundleID);
++    if (!metadata) return nil;
++    Class actionClass = NSClassFromString(@"LNAction");
++
++    // 1. initWithMetadata:bundleIdentifier:parameters: (metadata から型名・systemProtocols を決める)
++    SEL init1 = NSSelectorFromString(@"initWithMetadata:bundleIdentifier:parameters:");
++    Method m1 = class_getInstanceMethod(actionClass, init1);
++    if (m1) {
++        @try {
++            id action = ((id (*)(id, SEL, id, id, id))method_getImplementation(m1))(
++                [actionClass alloc], init1, metadata, bundleID, properties);
++            NSArray *protocols = [action valueForKey:@"systemProtocols"];
++            if (action && [action valueForKey:@"metadata"] && protocols.count > 0) {
++                LCBLog(@"  組み立て: initWithMetadata:bundleIdentifier:parameters:");
++                return action;
++            }
++            LCBLog(@"  組み立て 1: %@ (足りないので次へ)", action ? LCBSummarizeShape(action) : @"nil");
++        } @catch (NSException *e) {
++            LCBLog(@"  組み立て 1 で例外: %@", e);
++        }
++    } else {
++        LCBLog(@"  組み立て 1: initWithMetadata:bundleIdentifier:parameters: がありません");
++    }
++
++    // 2. 9 引数の内部 init に、metadata の型名・systemProtocols を渡す
++    SEL init2 = NSSelectorFromString(@"_initWithIdentifier:mangledTypeName:openAppWhenRun:explicitAuthenticationPolicy:outputFlags:outputType:systemProtocols:parameters:metadata:");
++    Method m2 = class_getInstanceMethod(actionClass, init2);
++    if (m2) {
++        @try {
++            id mangled = [metadata valueForKey:@"mangledTypeName"] ?: LCBFallbackMangledName;
++            id protocols = nil;
++            @try { protocols = [metadata valueForKey:@"systemProtocols"]; } @catch (NSException *e) {}
++            typedef id (*InitFunction)(id, SEL, id, id, BOOL, id, id, id, id, id, id);
++            id action = ((InitFunction)method_getImplementation(m2))(
++                [actionClass alloc], init2, LCBGuestIntentID, mangled, NO, nil, nil, nil,
++                protocols ?: @[], properties, metadata);
++            if (action) {
++                LCBLog(@"  組み立て: _initWithIdentifier:…:metadata: (systemProtocols=%@)",
++                       [protocols isKindOfClass:NSArray.class] ? (id)@([protocols count]) : (id)@"不明");
++                return action;
++            }
++        } @catch (NSException *e) {
++            LCBLog(@"  組み立て 2 で例外: %@", e);
++        }
++    } else {
++        LCBLog(@"  組み立て 2: _initWithIdentifier:…:metadata: がありません");
++    }
++    return nil;
++}
+ 
+ /// LNAppContext で 1 回実行する。completion は main キューで呼ぶ。
+ static void LCBPerform(id action, NSString *label, void (^completion)(id result, NSError *error)) {
+diff -ruN a/docs/AlarmKitBridge-diag2.md b/docs/AlarmKitBridge-diag2.md
+--- a/docs/AlarmKitBridge-diag2.md	2026-11-03 06:25:18.205536306 +0000
++++ b/docs/AlarmKitBridge-diag2.md	2026-11-03 06:38:16.001233184 +0000
+@@ -1,9 +1,11 @@
+-# AlarmKitBridge 検証版 (diag2 〜 diag2.3)
++# AlarmKitBridge 検証版 (diag2 〜 diag2.4)
+ 
+ > **diag2.1 (2026-11-03)**: 包み替えの作り方だけを変えた版。手順・集めるログは diag2 と同じ。
+ > **diag2.2 (2026-11-03)**: LiveProcess での実行が `intentNotFound` になる問題への対策。
+ > **diag2.3 (2026-11-03)**: diag2.2 の A (metadata の付け直し) が試されなかった不具合の修正。
+-> 成果物名は `LiveContainer-guestintent-diag2.3.ipa`。下の「diag2.3 の変更」を参照。
++> **diag2.4 (2026-11-03)**: 型紙を不要にした。検証は LiveContainer と BridgeProbe v2 の 2 つで完結する。
++> 成果物名は `LiveContainer-guestintent-diag2.4.ipa`。**手順は下の「diag2.4 の手順」だけを見ればよい**
++> (それより上の手順 3 の「型紙を作る」は不要になった)。
+ 
+ diag1 (LCGuestIntent + LiveProcess 起動) に、**ゲストを改変せずに** AlarmKit のボタンから
+ ゲスト自身の App Intent を動かす「透過ブリッジ」を足したもの。
+@@ -54,7 +56,7 @@
+ 
+ ## 手順
+ 
+-1. このフォルダを push → Actions **Build IPA (LCGuestIntent diag2.3)** → `LiveContainer-guestintent-diag2.3.ipa`
++1. このフォルダを push → Actions **Build IPA (LCGuestIntent diag2.4)** → `LiveContainer-guestintent-diag2.4.ipa`
+ 2. SideStore で上書きインストール (拡張は残す)
+ 3. **型紙を作る**: LC 内の AlarmClock v51 でアラームを 1 件登録し直す (保存するだけでよい。鳴らさなくてよい)
+    → `ファイル > LiveContainer > LCBridge > template-lcguestintent.archive` ができる
+@@ -221,3 +223,30 @@
+ metadata 付き: … metadata=LNActionMetadata (11BridgeProbe0B12SnoozeIntentV) …
+ 実行完了 [A: metadata 付き] … error=(null)   ← 成功
+ ```
++
++## diag2.4 の変更
++
++- 包み替え先の LCGuestIntent を、**LiveContainer 自身の `Metadata.appintents`** から組み立てる。
++  ゲストのプロセスから LiveContainer.app の場所を dyld のイメージ 0 で求め
++  (LiveProcess では `PlugIns/LiveProcess.appex` から 2 つ上)、`LNBundleMetadata` で
++  `com.kdt.livecontainer.guestIntent` の LNActionMetadata を読む。
++  LNAction は `initWithMetadata:bundleIdentifier:parameters:`、だめなら `_initWithIdentifier:…:metadata:` で作る
++- 型紙 (`template-lcguestintent.archive`) は不要。あれば予備として使う
++- 実行時の metadata の付け直し (diag2.3) はそのまま
++
++## diag2.4 の手順
++
++1. このフォルダを push → Actions **Build IPA (LCGuestIntent diag2.4)** → `LiveContainer-guestintent-diag2.4.ipa` を SideStore で上書きインストール
++2. `BridgeProbe-v2.0.0.zip` をビルドした ipa を LiveContainer に入れる (v1 を上書き)
++3. BridgeProbe を開き、スヌーズの方式を選んで「アラームを登録」→ 画面をロックして待つ
++4. 鳴ったら停止かスヌーズを **1 回だけ**押す
++5. BridgeProbe を開き「統合ログを開く」→ 共有ボタンで 1 つのファイルを送る
++
++bridge.log で見る行:
++
++```
++LiveContainer 本体: /…/LiveContainer.app (id=com.kdt.livecontainer.<TEAM>)
++メタデータ: com.kdt.livecontainer.guestIntent を見つけました
++組み立て: initWithMetadata:bundleIdentifier:parameters:
++包み替え: LiveContainer のメタデータから組み立て
++```

@@ -1,0 +1,274 @@
+diff -ruN a/.github/workflows/build-guest-intent.yml b/.github/workflows/build-guest-intent.yml
+--- a/.github/workflows/build-guest-intent.yml	2026-11-03 05:10:55.813787274 +0000
++++ b/.github/workflows/build-guest-intent.yml	2026-11-03 05:11:44.828319383 +0000
+@@ -7,7 +7,7 @@
+ # +SideStore 版は作らない。build_github.sh が SideStore の
+ # Metadata.appintents で上書きするため、LCGuestIntent が消える。
+ 
+-name: Build IPA (LCGuestIntent diag2)
++name: Build IPA (LCGuestIntent diag2.1)
+ 
+ on:
+   push:
+@@ -91,6 +91,13 @@
+             echo "::error::AlarmKitBridge.m が TweakLoader.dylib に入っていません"
+             exit 1
+           fi
++          # diag2.1: 型紙を複製する版が入ったか
++          if strings "$app/Frameworks/TweakLoader.dylib" | grep -q "actionWithParameters:"; then
++            echo "OK: AlarmKitBridge diag2.1 (actionWithParameters:)"
++          else
++            echo "::error::TweakLoader.dylib が diag2.1 の AlarmKitBridge ではありません"
++            exit 1
++          fi
+ 
+       - name: Create IPA
+         run: |
+@@ -102,5 +109,5 @@
+       - name: Upload IPA
+         uses: actions/upload-artifact@v4
+         with:
+-          name: LiveContainer-guestintent-diag2.ipa
++          name: LiveContainer-guestintent-diag2.1.ipa
+           path: LiveContainer.ipa
+diff -ruN a/TweakLoader/AlarmKitBridge.m b/TweakLoader/AlarmKitBridge.m
+--- a/TweakLoader/AlarmKitBridge.m	2026-11-03 05:10:55.839637277 +0000
++++ b/TweakLoader/AlarmKitBridge.m	2026-11-03 05:11:44.826534685 +0000
+@@ -25,6 +25,9 @@
+ //     このファイルが起動時に「保留中の要求」を見つけ、元の LNAction を
+ //     LNAppContext でゲストのプロセス内で実行する。終わったら自分で終了する。
+ //
++//  diag2.1: 包み替えは型紙を -[LNAction actionWithParameters:] で複製して
++//     引数だけ差し替える。metadata と systemProtocols が型紙と同じになる。
++//
+ //  記録先 (ゲストのコンテナ): Documents/LCBridge/bridge.log
+ //  型紙 (LiveContainer の Documents): Documents/LCBridge/template-lcguestintent.archive
+ //
+@@ -90,11 +93,35 @@
+     }
+ }
+ 
++/// LNAction の metadata / systemProtocols を短く表す (diag2.1)。
++/// AlarmKit が作る本物には両方入っている。包み替え後もそろっているかを見る。
++static NSString *LCBSummarizeShape(id action) {
++    id metadata = nil;
++    NSArray *protocols = nil;
++    @try { metadata = [action valueForKey:@"metadata"]; } @catch (NSException *e) {}
++    @try { protocols = [action valueForKey:@"systemProtocols"]; } @catch (NSException *e) {}
++    NSString *metaText = @"なし";
++    if (metadata) {
++        id metaType = nil;
++        @try { metaType = [metadata valueForKey:@"mangledTypeName"]; } @catch (NSException *e) {}
++        metaText = [NSString stringWithFormat:@"%@ (%@)", NSStringFromClass([metadata class]), metaType ?: @"?"];
++    }
++    NSMutableArray *protocolNames = [NSMutableArray array];
++    for (id protocol in protocols) {
++        id name = nil;
++        @try { name = [protocol valueForKey:@"identifier"]; } @catch (NSException *e) {}
++        [protocolNames addObject:name ?: NSStringFromClass([protocol class])];
++    }
++    return [NSString stringWithFormat:@"metadata=%@ systemProtocols=[%@]",
++            metaText, [protocolNames componentsJoinedByString:@","]];
++}
++
+ /// LNAction の中身を 1 行ずつ書き出す。
+ static void LCBDescribeAction(id action, NSString *label) {
+     LCBLog(@"  %@: identifier=%@ mangledTypeName=%@ openAppWhenRun=%@",
+            label, [action valueForKey:@"identifier"], [action valueForKey:@"mangledTypeName"],
+            [action valueForKey:@"openAppWhenRun"]);
++    LCBLog(@"    %@", LCBSummarizeShape(action));
+     NSArray *parameters = [action valueForKey:@"parameters"];
+     for (id property in parameters) {
+         id value = nil;
+@@ -106,18 +133,22 @@
+ 
+ #pragma mark - 包み替え
+ 
+-static id LCBMakeValue(NSString *string) {
++/// 文字列の LNValue を作る。valueType が渡されれば (型紙のもの) それを使う。
++static id LCBMakeValue(NSString *string, id valueType) {
+     Class valueClass = NSClassFromString(@"LNValue");
+-    Class typeClass = NSClassFromString(@"LNPrimitiveValueType");
+-    id type = ((id (*)(id, SEL))objc_msgSend)(typeClass, NSSelectorFromString(@"stringValueType"));
++    id type = valueType;
++    if (!type) {
++        Class typeClass = NSClassFromString(@"LNPrimitiveValueType");
++        type = ((id (*)(id, SEL))objc_msgSend)(typeClass, NSSelectorFromString(@"stringValueType"));
++    }
+     id value = [valueClass alloc];
+     return ((id (*)(id, SEL, id, id))objc_msgSend)(value, NSSelectorFromString(@"initWithValue:valueType:"), string, type);
+ }
+ 
+-static id LCBMakeProperty(NSString *identifier, NSString *string) {
++static id LCBMakeProperty(NSString *identifier, NSString *string, id valueType) {
+     id property = [NSClassFromString(@"LNProperty") alloc];
+     return ((id (*)(id, SEL, id, id))objc_msgSend)(property, NSSelectorFromString(@"initWithIdentifier:value:"),
+-                                                   identifier, LCBMakeValue(string));
++                                                   identifier, LCBMakeValue(string, valueType));
+ }
+ 
+ static id LCBUnarchive(NSData *data) {
+@@ -135,8 +166,16 @@
+ 
+ /// 元の LNAction を LCGuestIntent の LNAction に包む。
+ ///
+-/// 型紙 (スタブから作られた本物) があれば、引数の識別子と型名をそれに合わせる。
+-/// 無ければ Swift のプロパティ名 (handler / action / payload) を使う。
++/// diag2.1: 型紙 (AlarmKit がスタブから作った本物) があれば、型紙を複製して
++/// 引数だけ差し替える (`-[LNAction actionWithParameters:]`)。
++/// iPadOS 26.6.1 (23G83) の LinkMetadata を逆アセンブルして、このメソッドが
++/// identifier / mangledTypeName / openAppWhenRun / explicitAuthenticationPolicy /
++/// outputFlags / outputType / systemProtocols / metadata をすべて引き継ぎ、
++/// `_initWithIdentifier:...parameters:metadata:` を呼ぶことを確認済み。
++/// diag2 の `initWithIdentifier:mangledTypeName:openAppWhenRun:parameters:` では
++/// metadata (LNActionMetadata) と systemProtocols (SessionStarting) が空になっていた。
++///
++/// 型紙が無い・使えないときは diag2 と同じ手作りに戻る (metadata なし)。
+ static id LCBWrap(id original, NSData *archive) {
+     NSString *container = NSHomeDirectory().lastPathComponent;
+     NSString *bundleFolder = NSBundle.mainBundle.bundlePath.lastPathComponent;
+@@ -152,22 +191,34 @@
+     NSDictionary<NSString *, NSString *> *values = @{ @"handler": @"", @"action": LCBBridgeAction, @"payload": payloadText };
+ 
+     NSArray<NSString *> *identifiers = @[ @"handler", @"action", @"payload" ];
++    NSArray *valueTypes = nil;
+     NSString *mangledName = LCBFallbackMangledName;
+-    NSString *source = @"推測 (型紙なし)";
+ 
+     NSURL *hostDir = LCBHostDir();
+     NSURL *templateURL = hostDir ? [hostDir URLByAppendingPathComponent:@"template-lcguestintent.archive"] : nil;
+     NSData *templateData = templateURL ? [NSData dataWithContentsOfURL:templateURL] : nil;
+     if (!templateData) LCBLog(@"  型紙がありません (%@)", templateURL.path ?: @"LC_HOME_PATH なし");
+     id template = templateData ? LCBUnarchive(templateData) : nil;
++    if (template && ![template isKindOfClass:NSClassFromString(@"LNAction")]) {
++        LCBLog(@"  型紙が LNAction ではありません (%@)", NSStringFromClass([template class]));
++        template = nil;
++    }
+     if (template) {
+         NSArray *templateParameters = [template valueForKey:@"parameters"];
+         if (templateParameters.count == 3) {
+             identifiers = [templateParameters valueForKey:@"identifier"];
+             mangledName = [template valueForKey:@"mangledTypeName"] ?: mangledName;
+-            source = @"型紙";
++            NSMutableArray *types = [NSMutableArray array];
++            for (id property in templateParameters) {
++                id type = nil;
++                @try { type = [[property valueForKey:@"value"] valueForKey:@"valueType"]; } @catch (NSException *e) {}
++                [types addObject:type ?: NSNull.null];
++            }
++            valueTypes = types;
++            LCBLog(@"  型紙: %@", LCBSummarizeShape(template));
+         } else {
+             LCBLog(@"  型紙の引数が %lu 個なので使いません", (unsigned long)templateParameters.count);
++            template = nil;
+         }
+     }
+ 
+@@ -177,15 +228,35 @@
+     for (NSUInteger i = 0; i < identifiers.count; i++) {
+         NSString *identifier = identifiers[i];
+         NSString *value = values[identifier] ?: values[order[i]];
+-        [properties addObject:LCBMakeProperty(identifier, value)];
++        id type = valueTypes[i];
++        [properties addObject:LCBMakeProperty(identifier, value, type == NSNull.null ? nil : type)];
++    }
++
++    id action = nil;
++    NSString *source = nil;
++    SEL withParameters = NSSelectorFromString(@"actionWithParameters:");
++    if (template && [template respondsToSelector:withParameters]) {
++        @try {
++            action = ((id (*)(id, SEL, id))objc_msgSend)(template, withParameters, properties);
++            source = @"型紙を複製 (actionWithParameters:)";
++        } @catch (NSException *e) {
++            LCBLog(@"  actionWithParameters: が例外: %@", e);
++        }
++    } else if (template) {
++        LCBLog(@"  LNAction が actionWithParameters: に応答しません (iOS の変更?)");
++    }
++
++    if (!action) {
++        action = [NSClassFromString(@"LNAction") alloc];
++        action = ((id (*)(id, SEL, id, id, BOOL, id))objc_msgSend)(
++            action, NSSelectorFromString(@"initWithIdentifier:mangledTypeName:openAppWhenRun:parameters:"),
++            LCBGuestIntentID, mangledName, NO, properties);
++        source = template ? @"手作り (型紙の複製に失敗、metadata なし)" : @"手作り (型紙なし、metadata なし)";
+     }
+ 
+-    id action = [NSClassFromString(@"LNAction") alloc];
+-    action = ((id (*)(id, SEL, id, id, BOOL, id))objc_msgSend)(
+-        action, NSSelectorFromString(@"initWithIdentifier:mangledTypeName:openAppWhenRun:parameters:"),
+-        LCBGuestIntentID, mangledName, NO, properties);
+     LCBLog(@"  包み替え: 引数の識別子=%@ 型名=%@ (%@) payload=%lu 文字",
+-           [identifiers componentsJoinedByString:@","], mangledName, source, (unsigned long)payloadText.length);
++           [identifiers componentsJoinedByString:@","], [action valueForKey:@"mangledTypeName"], source,
++           (unsigned long)payloadText.length);
+     return action;
+ }
+ 
+diff -ruN a/docs/AlarmKitBridge-diag2.md b/docs/AlarmKitBridge-diag2.md
+--- a/docs/AlarmKitBridge-diag2.md	2026-11-03 05:10:55.844167012 +0000
++++ b/docs/AlarmKitBridge-diag2.md	2026-11-03 05:12:39.917530429 +0000
+@@ -1,4 +1,7 @@
+-# AlarmKitBridge 検証版 (diag2)
++# AlarmKitBridge 検証版 (diag2 / diag2.1)
++
++> **diag2.1 (2026-11-03)**: 包み替えの作り方だけを変えた版。手順・集めるログは diag2 と同じ
++> (成果物名が `LiveContainer-guestintent-diag2.1.ipa` になる)。下の「diag2.1 の変更」を参照。
+ 
+ diag1 (LCGuestIntent + LiveProcess 起動) に、**ゲストを改変せずに** AlarmKit のボタンから
+ ゲスト自身の App Intent を動かす「透過ブリッジ」を足したもの。
+@@ -49,7 +52,7 @@
+ 
+ ## 手順
+ 
+-1. このフォルダを push → Actions **Build IPA (LCGuestIntent diag2)** → `LiveContainer-guestintent-diag2.ipa`
++1. このフォルダを push → Actions **Build IPA (LCGuestIntent diag2.1)** → `LiveContainer-guestintent-diag2.1.ipa`
+ 2. SideStore で上書きインストール (拡張は残す)
+ 3. **型紙を作る**: LC 内の AlarmClock v51 でアラームを 1 件登録し直す (保存するだけでよい。鳴らさなくてよい)
+    → `ファイル > LiveContainer > LCBridge > template-lcguestintent.archive` ができる
+@@ -79,7 +82,7 @@
+ | 段 | 見る行 | 止まったときの意味 |
+ |---|---|---|
+ | A. フック | `bridge.log`: `AlarmKit が LNAction を保存形式にします` | 出ない → 呼び出し元判定 (AlarmKit) が外れた / 別 API で保存している |
+-| B. 包み替え | `包み替え: 引数の識別子=… (型紙)` | `推測 (型紙なし)` → 手順 3 をやり直す |
++| B. 包み替え | `包み替え: … (型紙を複製 (actionWithParameters:))` と、その下の `包み替え後` の `metadata=LNActionMetadata (13LiveContainer13LCGuestIntentV) systemProtocols=[com.apple.link.systemProtocol.SessionStarting]` | `手作り (型紙なし…)` → 手順 3 をやり直す。`手作り (型紙の複製に失敗…)` → 直前の行の理由を送る |
+ | C. 解決 | `lc-guest-intent.log`: `包み替えられた Intent: …ProbeStopIntent` | 出ない → AlarmKit が包み替えた LNAction を解決できなかった (型名・引数の不一致) |
+ | D. 起動 | `[結果] LiveProcess 起動成功` | diag1 と同じ切り分け |
+ | E. 実行 | `bridge.log`: `保留中の要求を実行します` → `実行完了 … error=` | error の domain/code が次の手掛かり |
+@@ -91,3 +94,35 @@
+ - 保留要求は 120 秒で無効。
+ - `LNAppContext` は非公開 API。iOS の更新で引数が変わると E で落ちる (ログに出る)。
+ - +SideStore 版では使えない (diag1 と同じ理由)。
++
++## diag2.1 の変更
++
++diag2 の型紙 (AlarmClock v51 が作った本物) を解析したら、AlarmKit が作る LNAction には
++次の 2 つが入っていた。diag2 の手作り (`initWithIdentifier:mangledTypeName:openAppWhenRun:parameters:`) では両方とも空になる。
++
++| 項目 | 本物 (型紙) | diag2 の手作り |
++|---|---|---|
++| `metadata` | `LNActionMetadata` (`13LiveContainer13LCGuestIntentV` / `LiveContainer.LCGuestIntent`) | なし |
++| `systemProtocols` | `com.apple.link.systemProtocol.SessionStarting` (= LiveActivityIntent) | なし |
++| `mangledTypeName` | `10AlarmClock13LCGuestIntentV` (ゲストのスタブ) | 型紙と同じ |
++
++diag2.1 では型紙を `-[LNAction actionWithParameters:]` で複製し、引数 3 つだけを差し替える。
++iPadOS 26.6.1 (23G83) の LinkMetadata を逆アセンブルし、このメソッドが identifier / mangledTypeName /
++openAppWhenRun / explicitAuthenticationPolicy / outputFlags / outputType / systemProtocols / metadata を
++すべて引き継いで `_initWithIdentifier:mangledTypeName:openAppWhenRun:explicitAuthenticationPolicy:outputFlags:outputType:systemProtocols:parameters:metadata:` を呼ぶことを確認した。
++引数の LNValue は型紙と同じ valueType (`LNPrimitiveValueType`, string) で作る。
++
++型紙が無い・使えないときは diag2 と同じ手作りに戻り、ログにその旨が出る。
++
++`bridge.log` には LNAction ごとに `metadata=… systemProtocols=[…]` の行が増えた。
++AlarmKit が BridgeProbe の Intent から作った元の LNAction にも metadata が入っているか
++(LiveContainer のメタデータに無い型なので、おそらく空) がここで分かる。
++
++| ファイル | 内容 |
++|---|---|
++| `TweakLoader/AlarmKitBridge.m` | 包み替えを型紙の複製に変更。metadata / systemProtocols をログに出す |
++| `.github/workflows/build-guest-intent.yml` | 名前と成果物を diag2.1 に。TweakLoader.dylib が diag2.1 かを検査 |
++| `docs/diag2-to-diag2.1.patch` | diag2 からの差分 |
++
++Info.plist と entitlements は変えていない。**上書きインストールで検証できる。** 型紙も作り直さなくてよい
++(diag2 で作った `template-lcguestintent.archive` をそのまま使う)。

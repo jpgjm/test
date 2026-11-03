@@ -1,0 +1,115 @@
+# LCGuestIntent 検証版のビルド。
+#
+# 本家の build.yml は submodule がそろっている前提で、ZIP から作った
+# リポジトリでは失敗する。こちらは submodule を固定 SHA で取り直してから
+# ビルドし、素の LiveContainer.ipa だけを作る。
+#
+# +SideStore 版は作らない。build_github.sh が SideStore の
+# Metadata.appintents で上書きするため、LCGuestIntent が消える。
+
+name: Build IPA (LCGuestIntent diag2.4)
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    env:
+      scheme: LiveContainer
+      archive_path: archive
+    steps:
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.2'
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 本家 main (9108ae62, 2026-10-17) の gitlink と同じ SHA。
+      # fishhook は .gitmodules に残っているだけで、ツリーにもプロジェクトにも無い。
+      - name: Restore submodules
+        run: |
+          set -euo pipefail
+          restore() {
+            local path="$1" url="$2" sha="$3"
+            if [ -d "$path" ] && [ -n "$(ls -A "$path" 2>/dev/null)" ]; then
+              echo "$path: 既にあります"
+              return
+            fi
+            rm -rf "$path"
+            git init -q "$path"
+            git -C "$path" remote add origin "$url"
+            git -C "$path" fetch -q --depth 1 origin "$sha"
+            git -C "$path" checkout -q FETCH_HEAD
+            echo "$path: $(git -C "$path" rev-parse HEAD)"
+          }
+          restore OpenSSL  https://github.com/krzyzanowskim/OpenSSL   623c84da314e85363236507ca38a4bde65df21c3
+          restore litehook https://github.com/LiveContainer/litehook  a7e9f599d7f0b3d77008ad62bf10cb10dab6eca9
+
+      - name: Archive
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -archivePath "$archive_path" \
+            -scheme "$scheme" \
+            -project LiveContainer.xcodeproj \
+            -sdk iphoneos -arch arm64 -configuration Release \
+            | tee xcodebuild.log | xcpretty
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild.log
+          path: xcodebuild.log
+          if-no-files-found: ignore
+
+      # LCGuestIntent がメタデータに入っていなければ、AlarmKit から解決されない。
+      - name: Inspect AppIntents metadata
+        run: |
+          set -euo pipefail
+          app="$archive_path.xcarchive/Products/Applications/LiveContainer.app"
+          meta="$app/Metadata.appintents"
+          ls -la "$meta"
+          data="$meta/extract.actionsdata"
+          for id in com.kdt.livecontainer.guestIntent LCGuestProbeIntent; do
+            if grep -q "$id" "$data"; then
+              echo "OK: $id"
+            else
+              echo "::error::$id が Metadata.appintents にありません"
+              exit 1
+            fi
+          done
+          ls "$app/PlugIns" || true
+          # diag2: AlarmKitBridge.m が TweakLoader に入ったか (同期フォルダは自動では入らない)
+          if strings "$app/Frameworks/TweakLoader.dylib" | grep -q "template-lcguestintent.archive"; then
+            echo "OK: AlarmKitBridge (TweakLoader.dylib)"
+          else
+            echo "::error::AlarmKitBridge.m が TweakLoader.dylib に入っていません"
+            exit 1
+          fi
+          # diag2.1: 型紙を複製する版 / diag2.2: 実行時のメタデータ対策が入ったか
+          for marker in "actionWithParameters:" "isAppMetadataViaXPCEnabled" "initWithBundle:usingEffectiveBundleIdentifier:error:" "initWithMetadata:mangledTypeName:parameters:" "initWithMetadata:bundleIdentifier:parameters:"; do
+            if strings "$app/Frameworks/TweakLoader.dylib" | grep -q "$marker"; then
+              echo "OK: AlarmKitBridge ($marker)"
+            else
+              echo "::error::TweakLoader.dylib に $marker がありません (diag2.2 の AlarmKitBridge ではない)"
+              exit 1
+            fi
+          done
+
+      - name: Create IPA
+        run: |
+          set -euo pipefail
+          mv "$archive_path.xcarchive/Products/Applications" Payload
+          zip -qr "$scheme.ipa" Payload -x "._*" -x ".DS_Store" -x "__MACOSX"
+          ls -la "$scheme.ipa"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveContainer-guestintent-diag2.4.ipa
+          path: LiveContainer.ipa
